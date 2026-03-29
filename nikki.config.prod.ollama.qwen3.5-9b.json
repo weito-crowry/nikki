@@ -24,8 +24,8 @@
     "ai.generate_category_candidates": false,
     "ai.classify_thread": false,
     "ai.extract_findings": false,
-    "ai.summarize_unit": false,
-    "ai.write_diary_entry": false,
+    "ai.summarize_unit": true,
+    "ai.write_diary_entry": true,
     "ai.rewrite_diary_entry": false
   },
   "maxCategories": 12,
@@ -34,6 +34,8 @@
   "freezeCategories": false,
   "force": false,
   "targetThreadItemIds": [
-    "thread_000001"
+    "thread_000001",
+    "thread_000002",
+    "thread_000003"
   ]
 }

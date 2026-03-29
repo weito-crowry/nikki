@@ -11,6 +11,7 @@ const execFileAsync = promisify(execFile);
 let appServerClientPromise = null;
 let activeDeltaConsoleKey = null;
 let activeDeltaConsoleTrailingNewline = true;
+const promptTemplateCache = new Map();
 
 export async function inspectZip(zipPath) {
   const lines = await listZipEntries(zipPath);
@@ -90,6 +91,19 @@ function resolveConfiguredProvider(value) {
     return "ollama";
   }
   return "codex";
+}
+
+function renderPromptTemplate(name, variables) {
+  let template = promptTemplateCache.get(name);
+  if (!template) {
+    const filePath = path.join(process.cwd(), "prompts", `${name}.txt`);
+    template = fs.readFileSync(filePath, "utf8");
+    promptTemplateCache.set(name, template);
+  }
+  return template.replace(/\{\{(\w+)\}\}/g, (_match, key) => {
+    const value = variables?.[key];
+    return typeof value === "undefined" || value === null ? "" : String(value);
+  });
 }
 
 function initRun(runtime) {
@@ -297,7 +311,10 @@ async function buildTaskMeta(runtime, definition, item) {
         return { inputHash: hashJson({ frozen: true, categories }), promptHash: hashText("ai.generate_category_candidates/frozen/v1"), model: resolveModelForTask(runtime, "ai.generate_category_candidates"), promptPreview: "カテゴリ候補生成（固定カテゴリ再利用）" };
       }
       const sample = loadScopedThreads(runtime).slice(0, 200).map((thread) => ({ itemId: thread.itemId, title: thread.title, primaryDate: thread.primaryDate, preview: thread.preview, generatedImageCount: thread.generatedImageCount }));
-      const prompt = ["以下は OpenAI エクスポートから抽出した会話スレッド一覧です。", "ユーザーの関心や疑問を日記にしやすいカテゴリを作ってください。", `カテゴリ数は最大 ${runtime.config.maxCategories} 個。`, "出力は JSON のみ。", '{"categories":[{"id":"short-id","label":"表示名","description":"分類方針","keywords":["語1","語2"]}]}', JSON.stringify(sample, null, 2)].join("\n\n");
+      const prompt = renderPromptTemplate("ai.generate_category_candidates", {
+        maxCategories: runtime.config.maxCategories,
+        sampleJson: JSON.stringify(sample, null, 2)
+      });
       return aiMeta(runtime, prompt, { maxCategories: runtime.config.maxCategories, sample });
     }
     case "ai.classify_thread": {
@@ -325,17 +342,27 @@ async function buildTaskMeta(runtime, definition, item) {
           classifications: availableThreadItemIds.map((threadItemId) => readArtifact(runtime, `artifacts/ai/thread_classification/${threadItemId}.json`)),
           findings: availableThreadItemIds.map((threadItemId) => readArtifact(runtime, `artifacts/ai/thread_findings/${threadItemId}.json`))
         };
-        const prompt = [`単位: ${unit.itemId}`, `表示名: ${unit.label}`, "以下の情報から日記用の unit 要約を作成してください。", "出力は JSON のみ。", '{"summaryTitle":"見出し","interests":["..."],"questions":["..."],"outcomes":["..."],"images":[{"path":"...","prompt":"...","note":"..."}],"narrative":"2-5文の要約"}', JSON.stringify(payload, null, 2)].join("\n\n");
+        const prompt = renderPromptTemplate("ai.summarize_unit", {
+          unitId: unit.itemId,
+          unitLabel: unit.label,
+          payloadJson: JSON.stringify(payload, null, 2)
+        });
         return aiMeta(runtime, prompt, payload);
       }
     case "ai.write_diary_entry": {
       const entry = readEntry(runtime, item.itemId);
-      const prompt = [`日記エントリID: ${entry.itemId}`, `対象日付: ${entry.date}`, "以下の unit 要約から、その日の日記本文草稿を作ってください。", "出力は JSON のみ。", '{"title":"見出し","lead":"導入","sections":[{"heading":"見出し","body":"本文"}],"closing":"締め","images":[{"path":"...","caption":"..."}]}', JSON.stringify(entry, null, 2)].join("\n\n");
+      const prompt = renderPromptTemplate("ai.write_diary_entry", {
+        entryId: entry.itemId,
+        entryDate: entry.date,
+        entryJson: JSON.stringify(entry, null, 2)
+      });
       return aiMeta(runtime, prompt, entry);
     }
     case "ai.rewrite_diary_entry": {
       const draft = readArtifact(runtime, `artifacts/ai/diary_drafts/${item.itemId}.json`) || {};
-      const prompt = ["次の日記草稿を自然な日本語の日記として整形してください。", "事実は変えず、冗長さだけを減らしてください。", "出力は JSON のみ。", '{"title":"見出し","markdownBody":"Markdown 本文","images":[{"path":"...","caption":"..."}]}', JSON.stringify(draft, null, 2)].join("\n\n");
+      const prompt = renderPromptTemplate("ai.rewrite_diary_entry", {
+        draftJson: JSON.stringify(draft, null, 2)
+      });
       return aiMeta(runtime, prompt, draft);
     }
     case "render.markdown":
@@ -433,11 +460,16 @@ async function collectAdaptiveThreadResults(runtime, options, groups, depth, pat
 }
 
 function buildClassifyThreadPrompt(categories, payload) {
-  return ["次のスレッド全体を主カテゴリ 1 件と補助カテゴリ最大 2 件に分類してください。", "長いスレッドは複数チャンクの一部である可能性があります。与えられた内容だけから妥当な分類をしてください。", "既存カテゴリで収まりが悪い場合のみ、新カテゴリ候補を proposedCategories に追加してください。", "新カテゴリ候補は最小限にしてください。", "出力は JSON のみ。", '{"primary":"category-id","secondary":["category-id"],"reason":"短い理由","proposedCategories":[{"id":"new-category-id","label":"表示名","description":"分類方針","keywords":["語1","語2"]}]}', "カテゴリ定義:", JSON.stringify(categories.categories || [], null, 2), "対象スレッド:", JSON.stringify(payload, null, 2)].join("\n\n");
+  return renderPromptTemplate("ai.classify_thread", {
+    categoriesJson: JSON.stringify(categories.categories || [], null, 2),
+    payloadJson: JSON.stringify(payload, null, 2)
+  });
 }
 
 function buildExtractFindingsPrompt(payload) {
-  return ["次の会話スレッドから日記に必要な構造化情報を抽出してください。", "長いスレッドは複数チャンクの一部である可能性があります。与えられた内容だけから抽出してください。", "重視点: interests, questions, outcomes, images, narrative", "出力は JSON のみ。", '{"interests":["..."],"questions":[{"text":"...","status":"resolved|partially_resolved|unresolved"}],"outcomes":["..."],"images":[{"path":"...","note":"..."}],"narrative":"2-5文の要約"}', JSON.stringify(payload, null, 2)].join("\n\n");
+  return renderPromptTemplate("ai.extract_findings", {
+    payloadJson: JSON.stringify(payload, null, 2)
+  });
 }
 
 function mergeClassificationResults(items) {
@@ -1342,8 +1374,6 @@ function buildImageIndex(extractDir) {
 async function askForJson(runtime, taskKey, itemId, name, meta) {
   const dir = path.join(runtime.paths.root, ".codex-temp");
   ensureDir(dir);
-  const promptPath = path.join(dir, `${name.replace(/[^a-zA-Z0-9-_]/g, "_")}.prompt.txt`);
-  fs.writeFileSync(promptPath, ["あなたは JSON のみを返す情報整理アシスタントです。", "前置き、説明、コードブロックは禁止です。", "コマンド実行、ファイル変更、ツール使用は禁止です。", "必ず単一の JSON オブジェクトだけを返してください。", "", meta.prompt].join("\n"), "utf8");
   const cacheKey = aiCacheKey(taskKey, meta);
   const cachePath = path.join(runtime.paths.cache, `${cacheKey}.json`);
   const cached = readJson(cachePath);
@@ -1352,66 +1382,59 @@ async function askForJson(runtime, taskKey, itemId, name, meta) {
     writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: meta.promptPreview, sentAt: cached.cachedAt || null, note: "AI cache を再利用しました", lastEvent: "task.cache_hit" });
     return { text: cached.text, parsed: cached.parsed, cacheHit: true };
   }
-  logTextBlock("prompt", `${taskKey}__${itemId}`, meta.prompt);
   const client = await getAppServerClient(runtime.config);
-  const text = await runAiWithRetry(runtime, taskKey, itemId, async () => client.runJsonTurn({
-    model: meta.model,
-    think: meta.think,
-    cwd: process.cwd(),
-    prompt: meta.prompt,
-    onProgress: (event) => {
-      runtime.current.sentAt = event.sentAt || runtime.current.sentAt;
-      if (event.phase === "thinking" && event.thinkingText) {
-        logThinkingConsole(taskKey, itemId, event.thinkingText);
+  for (let parseAttempt = 1; parseAttempt <= 2; parseAttempt += 1) {
+    const prompt = parseAttempt === 1 ? meta.prompt : buildJsonRepairPrompt(meta.prompt);
+    const promptPath = path.join(dir, `${name.replace(/[^a-zA-Z0-9-_]/g, "_")}${parseAttempt > 1 ? `__retry${parseAttempt}` : ""}.prompt.txt`);
+    fs.writeFileSync(promptPath, ["あなたは JSON のみを返す情報整理アシスタントです。", "前置き、説明、コードブロックは禁止です。", "コマンド実行、ファイル変更、ツール使用は禁止です。", "必ず単一の JSON オブジェクトだけを返してください。", "", prompt].join("\n"), "utf8");
+    logTextBlock("prompt", `${taskKey}__${itemId}${parseAttempt > 1 ? ` retry=${parseAttempt}` : ""}`, prompt);
+    const text = await runAiWithRetry(runtime, taskKey, itemId, async () => client.runJsonTurn({
+      model: meta.model,
+      think: meta.think,
+      cwd: process.cwd(),
+      prompt,
+      onProgress: (event) => {
+        runtime.current.sentAt = event.sentAt || runtime.current.sentAt;
+        if (event.phase === "thinking" && event.thinkingText) {
+          logThinkingConsole(taskKey, itemId, event.thinkingText);
+        }
+        if (event.phase === "agent-message" && event.deltaText) {
+          logResponseDeltaConsole(taskKey, itemId, event.deltaText);
+        }
+        writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: event.promptPreview || runtime.current.promptPreview, sentAt: event.sentAt || runtime.current.sentAt, note: event.note || null, lastEvent: `ai.${event.phase || "progress"}` });
       }
-      if (event.phase === "agent-message" && event.deltaText) {
-        logResponseDeltaConsole(taskKey, itemId, event.deltaText);
-      }
-      writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: event.promptPreview || runtime.current.promptPreview, sentAt: event.sentAt || runtime.current.sentAt, note: event.note || null, lastEvent: `ai.${event.phase || "progress"}` });
+    })).catch((error) => {
+      throw normalizeAiFailure(error);
+    });
+    flushResponseDeltaConsole(taskKey, itemId);
+    logTextBlock("response", `${taskKey}__${itemId}${parseAttempt > 1 ? ` retry=${parseAttempt}` : ""}`, text);
+    writeRaw(runtime, taskKey, itemId, text);
+    const parsedResult = parseAiJsonResponse(text);
+    if (parsedResult.parsed) {
+      writeJson(cachePath, { schemaVersion: 1, cachedAt: isoJst(), taskKey, itemId, model: meta.model, think: meta.think, inputHash: meta.inputHash, promptHash: meta.promptHash, text, parsed: parsedResult.parsed });
+      return { text, parsed: parsedResult.parsed, cacheHit: false };
     }
-  })).catch((error) => {
-    throw normalizeAiFailure(error);
-  });
-  flushResponseDeltaConsole(taskKey, itemId);
-  logTextBlock("response", `${taskKey}__${itemId}`, text);
-  writeRaw(runtime, taskKey, itemId, text);
-  const normalized = stripFence(text.trim());
-  if (/^Error:/i.test(normalized)) {
-    throw normalizeAiFailure(new Error(normalized));
+    writeParseError(runtime, taskKey, itemId, {
+      parseAttempt,
+      model: meta.model,
+      think: meta.think,
+      promptHash: meta.promptHash,
+      inputHash: meta.inputHash,
+      ...parsedResult
+    });
+    emitEvent(runtime, { type: "task.json_parse_error", stage: runtime.current.stage, taskKey, itemType: runtime.current.itemType, itemId, taskInstanceId: runtime.current.taskInstanceId, note: `JSON 解析に失敗しました (attempt=${parseAttempt})` });
+    if (parseAttempt < 2) {
+      const note = `JSON 形式エラーのため、より厳しい JSON 指示で再実行します (${parseAttempt}/2)`;
+      emitEvent(runtime, { type: "task.retry_scheduled", stage: runtime.current.stage, taskKey, itemType: runtime.current.itemType, itemId, taskInstanceId: runtime.current.taskInstanceId, note });
+      writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: runtime.current.promptPreview, sentAt: runtime.current.sentAt, note, lastEvent: "task.retry_scheduled" });
+      continue;
+    }
+    if (/prompt token count .* exceeds the limit/i.test(parsedResult.normalized || "")) {
+      throw new Error(`AI プロンプトが長すぎます: ${clip(parsedResult.normalized, 220)}`);
+    }
+    throw new Error(`AI が JSON ではない応答を返しました: ${clip(parsedResult.normalized || text, 220)}`);
   }
-  let parsed;
-  try {
-    parsed = JSON.parse(normalized);
-  } catch (error) {
-    const fenced = recoverLastJsonFence(normalized);
-    if (fenced) {
-      try {
-        parsed = JSON.parse(fenced);
-      } catch {}
-    }
-    const recovered = recoverJsonObjectText(normalized);
-    if (!parsed && recovered) {
-      try {
-        parsed = JSON.parse(recovered);
-      } catch {}
-    }
-    if (!parsed) {
-      const repaired = repairJsonText(recovered || normalized);
-      if (repaired) {
-        try {
-          parsed = JSON.parse(repaired);
-        } catch {}
-      }
-    }
-    if (!parsed) {
-      if (/prompt token count .* exceeds the limit/i.test(normalized)) {
-        throw new Error(`AI プロンプトが長すぎます: ${clip(normalized, 220)}`);
-      }
-      throw new Error(`AI が JSON ではない応答を返しました: ${clip(normalized, 220)}`);
-    }
-  }
-  writeJson(cachePath, { schemaVersion: 1, cachedAt: isoJst(), taskKey, itemId, model: meta.model, inputHash: meta.inputHash, promptHash: meta.promptHash, text, parsed });
-  return { text, parsed, cacheHit: false };
+  throw new Error("AI の JSON 応答を取得できませんでした。");
 }
 
 async function runAiWithRetry(runtime, taskKey, itemId, run) {
@@ -1475,6 +1498,16 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function buildJsonRepairPrompt(prompt) {
+  return [
+    prompt,
+    "",
+    "前回の応答は JSON 構文が壊れていました。",
+    "今回は必ず JSON 構文として正しい単一の JSON オブジェクトだけを返してください。",
+    "配列やオブジェクトを壊さず、重複キーや途中で切れた配列を作らないでください。"
+  ].join("\n");
+}
+
 function recoverJsonObjectText(text) {
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
@@ -1493,6 +1526,35 @@ function recoverLastJsonFence(text) {
   return last || null;
 }
 
+function parseAiJsonResponse(text) {
+  const normalized = stripFence(String(text || "").trim());
+  if (/^Error:/i.test(normalized)) {
+    throw normalizeAiFailure(new Error(normalized));
+  }
+  try {
+    return { parsed: JSON.parse(normalized), normalized, fenced: null, recovered: null, repaired: null };
+  } catch {}
+  const fenced = recoverLastJsonFence(normalized);
+  if (fenced) {
+    try {
+      return { parsed: JSON.parse(fenced), normalized, fenced, recovered: null, repaired: null };
+    } catch {}
+  }
+  const recovered = recoverJsonObjectText(normalized);
+  if (recovered) {
+    try {
+      return { parsed: JSON.parse(recovered), normalized, fenced, recovered, repaired: null };
+    } catch {}
+  }
+  const repaired = repairJsonText(recovered || normalized);
+  if (repaired) {
+    try {
+      return { parsed: JSON.parse(repaired), normalized, fenced, recovered, repaired };
+    } catch {}
+  }
+  return { parsed: null, normalized, fenced, recovered, repaired };
+}
+
 function repairJsonText(text) {
   if (!text) {
     return null;
@@ -1506,6 +1568,7 @@ function repairJsonText(text) {
     .replaceAll("」", "\"")
     .replaceAll("’", "'")
     .replaceAll("‘", "'");
+  text = text.replace(/\]\s*,\s*\[/g, ",");
   text = repairMalformedKeywordsField(text);
   let result = "";
   let inString = false;
@@ -1559,6 +1622,7 @@ function compareQuestionStatus(left, right) { const rank = { unresolved: 0, part
 function readArtifact(runtime, relativePath) { return readJson(path.join(runtime.paths.root, relativePath)); }
 function writeArtifact(runtime, relativePath, value) { writeJson(path.join(runtime.paths.root, relativePath), value); }
 function writeRaw(runtime, taskKey, itemId, text) { writeArtifact(runtime, `artifacts/raw/${taskKey}/${itemId}.raw.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, taskKey, itemId, rawText: text }); }
+function writeParseError(runtime, taskKey, itemId, value) { writeArtifact(runtime, `artifacts/raw/${taskKey}/${itemId}.parse-error.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, taskKey, itemId, ...value }); }
 function readUnit(runtime, itemId) { const item = (readArtifact(runtime, "artifacts/units/units.json")?.items || []).find((candidate) => candidate.itemId === itemId); if (!item) throw new Error(`unit が見つかりません: ${itemId}`); return item; }
 function readEntry(runtime, itemId) { const units = (readArtifact(runtime, "artifacts/units/units.json")?.items || []).filter((unit) => unit.entryId === itemId); if (!units.length) throw new Error(`entry が見つかりません: ${itemId}`); return { itemId, date: units[0].date || itemId.replace(/^entry_/, ""), units, unitSummaries: units.map((unit) => readArtifact(runtime, `artifacts/ai/unit_summaries/${unit.itemId}.json`)).filter(Boolean) }; }
 function loadThreads(runtime) { return (readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || []).map((thread) => readArtifact(runtime, `artifacts/normalized/${thread.itemId}.json`)).filter(Boolean); }

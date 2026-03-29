@@ -9,6 +9,8 @@ import { TASK_DEFINITIONS } from "./task-definitions.js";
 
 const execFileAsync = promisify(execFile);
 let appServerClientPromise = null;
+let activeDeltaConsoleKey = null;
+let activeDeltaConsoleTrailingNewline = true;
 
 export async function inspectZip(zipPath) {
   const lines = await listZipEntries(zipPath);
@@ -55,7 +57,7 @@ export async function runPipeline(inputConfig) {
 function createRuntime(config) {
   const runId = sanitizeId(config.runId || path.basename(config.outputDir || "run"));
   const now = isoJst();
-  const provider = config.provider === "copilot" ? "copilot" : "codex";
+  const provider = resolveConfiguredProvider(config.provider);
   const runtimeConfig = normalizeAgentRuntimeConfig(config, provider);
   return {
     config: { ...config, provider, runtime: runtimeConfig, runId, taskModels: config.taskModels || {} },
@@ -78,6 +80,16 @@ function createRuntime(config) {
     current: { stage: null, taskKey: null, itemType: null, itemId: null, taskInstanceId: null, promptPreview: null, sentAt: null, lastEvent: null, note: null },
     lock: null
   };
+}
+
+function resolveConfiguredProvider(value) {
+  if (value === "copilot") {
+    return "copilot";
+  }
+  if (value === "ollama") {
+    return "ollama";
+  }
+  return "codex";
 }
 
 function initRun(runtime) {
@@ -338,7 +350,26 @@ async function buildTaskMeta(runtime, definition, item) {
 }
 
 function aiMeta(runtime, prompt, input) {
-  return { prompt, input, inputHash: hashJson(input), promptHash: hashText(prompt), model: resolveModelForTask(runtime, runtime.current.taskKey), promptPreview: clip(prompt.replace(/\s+/g, " "), 220) };
+  return {
+    prompt,
+    input,
+    inputHash: hashJson(input),
+    promptHash: hashText(prompt),
+    model: resolveModelForTask(runtime, runtime.current.taskKey),
+    think: resolveThinkForTask(runtime, runtime.current.taskKey),
+    promptPreview: clip(prompt.replace(/\s+/g, " "), 220)
+  };
+}
+
+function aiProviderLabel(runtime) {
+  const provider = resolveRuntimeProvider(runtime.config);
+  if (provider === "copilot") {
+    return "copilot-acp";
+  }
+  if (provider === "ollama") {
+    return "ollama";
+  }
+  return "codex-app-server";
 }
 
 async function askForAdaptiveThreadJson(runtime, options) {
@@ -1136,7 +1167,7 @@ async function handleCategories(runtime, meta) {
     return ["artifacts/ai/category_master.json", "artifacts/ai/categories.json"];
   }
   const response = await askForJson(runtime, "ai.generate_category_candidates", "run", "categories", meta);
-  writeCategoryMaster(runtime, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, categories: Array.isArray(response.parsed.categories) ? response.parsed.categories : [], aiMeta: { model: meta.model, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: "codex-app-server", cacheHit: response.cacheHit } });
+  writeCategoryMaster(runtime, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, categories: Array.isArray(response.parsed.categories) ? response.parsed.categories : [], aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit } });
   writeRaw(runtime, "ai.generate_category_candidates", "run", response.text);
   return ["artifacts/ai/category_master.json", "artifacts/ai/categories.json", "artifacts/raw/ai.generate_category_candidates/run.raw.json"];
 }
@@ -1150,7 +1181,7 @@ async function handleClassifyThread(runtime, itemId, meta) {
   if (masterUpdated) {
     artifactPaths.push("artifacts/ai/category_master.json", "artifacts/ai/categories.json");
   }
-  writeArtifact(runtime, `artifacts/ai/thread_classification/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, primary: response.parsed.primary || "uncategorized", secondary: Array.isArray(response.parsed.secondary) ? response.parsed.secondary : [], reason: response.parsed.reason || "", proposedCategories: Array.isArray(response.parsed.proposedCategories) ? response.parsed.proposedCategories : [], aiMeta: { model: meta.model, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: `${runtime.config.provider}-app-server`, cacheHit: response.cacheHit, adaptiveSplit: response.adaptiveSplit, chunkCount: response.chunkCount, categoryMasterUpdated: masterUpdated } });
+  writeArtifact(runtime, `artifacts/ai/thread_classification/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, primary: response.parsed.primary || "uncategorized", secondary: Array.isArray(response.parsed.secondary) ? response.parsed.secondary : [], reason: response.parsed.reason || "", proposedCategories: Array.isArray(response.parsed.proposedCategories) ? response.parsed.proposedCategories : [], aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit, adaptiveSplit: response.adaptiveSplit, chunkCount: response.chunkCount, categoryMasterUpdated: masterUpdated } });
   writeRaw(runtime, "ai.classify_thread", itemId, response.text);
   return artifactPaths;
 }
@@ -1158,7 +1189,7 @@ async function handleClassifyThread(runtime, itemId, meta) {
 async function handleExtractFindings(runtime, itemId, meta) {
   const thread = readArtifact(runtime, `artifacts/normalized/${itemId}.json`);
   const response = await askForAdaptiveThreadJson(runtime, { taskKey: "ai.extract_findings", itemId, name: `findings-${itemId}`, model: meta.model, thread, baseInput: { threadId: itemId }, buildPrompt: (payload) => buildExtractFindingsPrompt(payload), mergeParsed: mergeFindingsResults });
-  writeArtifact(runtime, `artifacts/ai/thread_findings/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, interests: Array.isArray(response.parsed.interests) ? response.parsed.interests : [], questions: Array.isArray(response.parsed.questions) ? response.parsed.questions : [], outcomes: Array.isArray(response.parsed.outcomes) ? response.parsed.outcomes : [], images: Array.isArray(response.parsed.images) ? response.parsed.images : [], narrative: response.parsed.narrative || "", aiMeta: { model: meta.model, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: `${runtime.config.provider}-app-server`, cacheHit: response.cacheHit, adaptiveSplit: response.adaptiveSplit, chunkCount: response.chunkCount } });
+  writeArtifact(runtime, `artifacts/ai/thread_findings/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, interests: Array.isArray(response.parsed.interests) ? response.parsed.interests : [], questions: Array.isArray(response.parsed.questions) ? response.parsed.questions : [], outcomes: Array.isArray(response.parsed.outcomes) ? response.parsed.outcomes : [], images: Array.isArray(response.parsed.images) ? response.parsed.images : [], narrative: response.parsed.narrative || "", aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit, adaptiveSplit: response.adaptiveSplit, chunkCount: response.chunkCount } });
   writeRaw(runtime, "ai.extract_findings", itemId, response.text);
   return [`artifacts/ai/thread_findings/${itemId}.json`, `artifacts/raw/ai.extract_findings/${itemId}.raw.json`];
 }
@@ -1203,7 +1234,7 @@ function handleGroupUnits(runtime) {
 async function handleSummarizeUnit(runtime, itemId, meta) {
   const response = await askForJson(runtime, "ai.summarize_unit", itemId, `unit-${itemId}`, meta);
   const unit = readUnit(runtime, itemId);
-  writeArtifact(runtime, `artifacts/ai/unit_summaries/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, label: unit.label, date: unit.date, category: unit.category, summaryTitle: response.parsed.summaryTitle || unit.label, interests: Array.isArray(response.parsed.interests) ? response.parsed.interests : [], questions: Array.isArray(response.parsed.questions) ? response.parsed.questions : [], outcomes: Array.isArray(response.parsed.outcomes) ? response.parsed.outcomes : [], images: Array.isArray(response.parsed.images) ? response.parsed.images : [], narrative: response.parsed.narrative || "", aiMeta: { model: meta.model, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: "codex-app-server", cacheHit: response.cacheHit } });
+  writeArtifact(runtime, `artifacts/ai/unit_summaries/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, label: unit.label, date: unit.date, category: unit.category, summaryTitle: response.parsed.summaryTitle || unit.label, interests: Array.isArray(response.parsed.interests) ? response.parsed.interests : [], questions: Array.isArray(response.parsed.questions) ? response.parsed.questions : [], outcomes: Array.isArray(response.parsed.outcomes) ? response.parsed.outcomes : [], images: Array.isArray(response.parsed.images) ? response.parsed.images : [], narrative: response.parsed.narrative || "", aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit } });
   writeRaw(runtime, "ai.summarize_unit", itemId, response.text);
   return [`artifacts/ai/unit_summaries/${itemId}.json`, `artifacts/raw/ai.summarize_unit/${itemId}.raw.json`];
 }
@@ -1211,7 +1242,7 @@ async function handleSummarizeUnit(runtime, itemId, meta) {
 async function handleWriteEntry(runtime, itemId, meta) {
   const response = await askForJson(runtime, "ai.write_diary_entry", itemId, `entry-draft-${itemId}`, meta);
   const entry = readEntry(runtime, itemId);
-  writeArtifact(runtime, `artifacts/ai/diary_drafts/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, date: entry.date, title: response.parsed.title || `${entry.date} の日記`, lead: response.parsed.lead || "", sections: Array.isArray(response.parsed.sections) ? response.parsed.sections : [], closing: response.parsed.closing || "", images: Array.isArray(response.parsed.images) ? response.parsed.images : [], aiMeta: { model: meta.model, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: "codex-app-server", cacheHit: response.cacheHit } });
+  writeArtifact(runtime, `artifacts/ai/diary_drafts/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, date: entry.date, title: response.parsed.title || `${entry.date} の日記`, lead: response.parsed.lead || "", sections: Array.isArray(response.parsed.sections) ? response.parsed.sections : [], closing: response.parsed.closing || "", images: Array.isArray(response.parsed.images) ? response.parsed.images : [], aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit } });
   writeRaw(runtime, "ai.write_diary_entry", itemId, response.text);
   return [`artifacts/ai/diary_drafts/${itemId}.json`, `artifacts/raw/ai.write_diary_entry/${itemId}.raw.json`];
 }
@@ -1219,7 +1250,7 @@ async function handleWriteEntry(runtime, itemId, meta) {
 async function handleRewriteEntry(runtime, itemId, meta) {
   const response = await askForJson(runtime, "ai.rewrite_diary_entry", itemId, `entry-final-${itemId}`, meta);
   const draft = readArtifact(runtime, `artifacts/ai/diary_drafts/${itemId}.json`) || {};
-  writeArtifact(runtime, `artifacts/ai/diary_entries/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, date: draft.date, title: response.parsed.title || draft.title, markdownBody: response.parsed.markdownBody || draftToMarkdown(draft), images: Array.isArray(response.parsed.images) ? response.parsed.images : draft.images || [], aiMeta: { model: meta.model, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: "codex-app-server", cacheHit: response.cacheHit } });
+  writeArtifact(runtime, `artifacts/ai/diary_entries/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, date: draft.date, title: response.parsed.title || draft.title, markdownBody: response.parsed.markdownBody || draftToMarkdown(draft), images: Array.isArray(response.parsed.images) ? response.parsed.images : draft.images || [], aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit } });
   writeRaw(runtime, "ai.rewrite_diary_entry", itemId, response.text);
   return [`artifacts/ai/diary_entries/${itemId}.json`, `artifacts/raw/ai.rewrite_diary_entry/${itemId}.raw.json`];
 }
@@ -1321,18 +1352,28 @@ async function askForJson(runtime, taskKey, itemId, name, meta) {
     writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: meta.promptPreview, sentAt: cached.cachedAt || null, note: "AI cache を再利用しました", lastEvent: "task.cache_hit" });
     return { text: cached.text, parsed: cached.parsed, cacheHit: true };
   }
+  logTextBlock("prompt", `${taskKey}__${itemId}`, meta.prompt);
   const client = await getAppServerClient(runtime.config);
   const text = await runAiWithRetry(runtime, taskKey, itemId, async () => client.runJsonTurn({
     model: meta.model,
+    think: meta.think,
     cwd: process.cwd(),
     prompt: meta.prompt,
     onProgress: (event) => {
       runtime.current.sentAt = event.sentAt || runtime.current.sentAt;
+      if (event.phase === "thinking" && event.thinkingText) {
+        logThinkingConsole(taskKey, itemId, event.thinkingText);
+      }
+      if (event.phase === "agent-message" && event.deltaText) {
+        logResponseDeltaConsole(taskKey, itemId, event.deltaText);
+      }
       writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: event.promptPreview || runtime.current.promptPreview, sentAt: event.sentAt || runtime.current.sentAt, note: event.note || null, lastEvent: `ai.${event.phase || "progress"}` });
     }
   })).catch((error) => {
     throw normalizeAiFailure(error);
   });
+  flushResponseDeltaConsole(taskKey, itemId);
+  logTextBlock("response", `${taskKey}__${itemId}`, text);
   writeRaw(runtime, taskKey, itemId, text);
   const normalized = stripFence(text.trim());
   if (/^Error:/i.test(normalized)) {
@@ -1465,6 +1506,7 @@ function repairJsonText(text) {
     .replaceAll("」", "\"")
     .replaceAll("’", "'")
     .replaceAll("‘", "'");
+  text = repairMalformedKeywordsField(text);
   let result = "";
   let inString = false;
   let escaped = false;
@@ -1498,6 +1540,14 @@ function repairJsonText(text) {
   }
 
   return result.trim() || null;
+}
+
+function repairMalformedKeywordsField(text) {
+  let repaired = String(text);
+  repaired = repaired.replace(/"keywords"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"/g, (_match, a, b, c, d) => `"keywords":["${a}","${b}","${c}","${d}"]`);
+  repaired = repaired.replace(/"keywords"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"/g, (_match, a, b, c) => `"keywords":["${a}","${b}","${c}"]`);
+  repaired = repaired.replace(/"keywords"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"/g, (_match, a, b) => `"keywords":["${a}","${b}"]`);
+  return repaired;
 }
 
 function stripFence(text) { return text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, ""); }
@@ -1810,10 +1860,64 @@ function wrapBlogPostHtml(post, entry, posts) {
     function wrapHtml(bodyHtml) { return `<!doctype html><html lang="ja"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Nikki Diary</title><style>:root{--bg:#f5f0e8;--panel:#fffaf3;--ink:#1f1a17;--accent:#a54b2a;--line:#ddcdbd}body{margin:0;font-family:"Yu Mincho","Hiragino Mincho ProN",serif;color:var(--ink);background:radial-gradient(circle at top left,rgba(165,75,42,.10),transparent 28%),linear-gradient(180deg,#f7efe4 0%,#efe5d6 100%)}main{max-width:900px;margin:0 auto;padding:48px 20px 80px}article{background:var(--panel);border:1px solid var(--line);border-radius:20px;box-shadow:0 16px 40px rgba(53,37,24,.08);padding:40px}h1,h2,h3{line-height:1.3}h1{font-size:2.2rem;border-bottom:2px solid var(--accent);padding-bottom:.4em}h2{margin-top:2.4em;color:var(--accent)}p,li{font-size:1rem;line-height:1.9}ul{padding-left:1.4em}.blog-image-gallery,.blog-thread-list{margin-top:32px;padding-top:20px;border-top:1px solid var(--line)}.blog-image-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}.blog-image-card{margin:0}.blog-image-card img{display:block;width:100%;height:auto;border-radius:14px;border:1px solid var(--line)}.blog-image-card figcaption{margin-top:8px;font-size:.95rem;line-height:1.7}.blog-thread-category{color:var(--accent)}.blog-thread-link{margin-left:.5em}@media print{body{background:#fff}main{padding:0}article{box-shadow:none;border:none;border-radius:0;padding:0}}</style></head><body><main><article>${bodyHtml}</article></main></body></html>`; }
 function emitEvent(runtime, payload) { fs.appendFileSync(runtime.paths.events, `${JSON.stringify({ at: isoJst(), runId: runtime.config.runId, ...payload })}\n`, "utf8"); runtime.current.lastEvent = payload.type || null; runtime.current.note = payload.note || null; }
 function writeProgress(runtime, override = {}) { const started = new Date(runtime.startedAt); writeJson(runtime.paths.progress, { schemaVersion: 1, runId: runtime.config.runId, status: override.status ?? "running", stage: override.stage ?? runtime.current.stage, taskKey: override.taskKey ?? runtime.current.taskKey, itemType: override.itemType ?? runtime.current.itemType, currentItemId: override.currentItemId ?? runtime.current.itemId, currentTaskInstanceId: override.currentTaskInstanceId ?? runtime.current.taskInstanceId, counts: { ...runtime.counts }, startedAt: runtime.startedAt, updatedAt: isoJst(), elapsedSec: Number.isNaN(started.getTime()) ? 0 : Math.max(Math.floor((Date.now() - started.getTime()) / 1000), 0), lastEvent: override.lastEvent ?? runtime.current.lastEvent, promptPreview: override.promptPreview ?? runtime.current.promptPreview, sentAt: override.sentAt ?? runtime.current.sentAt, note: override.note ?? runtime.current.note }); }
-function logConsole(label, target, note = "") { const suffix = note ? ` ${note}` : ""; console.log(`${consoleTime()} [${label}] ${target}${suffix}`); }
+function logConsole(label, target, note = "") { ensureDeltaConsoleClosed(); const suffix = note ? ` ${note}` : ""; console.log(`${consoleTime()} [${label}] ${target}${suffix}`); }
+function logTextBlock(label, target, text) {
+  ensureDeltaConsoleClosed();
+  console.log(`${consoleTime()} [${label}] ${target}`);
+  console.log(String(text ?? "").trim());
+}
+function logThinkingConsole(taskKey, itemId, thinkingText) {
+  ensureDeltaConsoleClosed();
+  console.log(`${consoleTime()} [think] ${taskKey}__${itemId}`);
+  console.log(String(thinkingText).trim());
+}
+function logResponseDeltaConsole(taskKey, itemId, text) {
+  const key = `${taskKey}__${itemId}`;
+  const chunk = String(text ?? "");
+  if (!chunk) {
+    return;
+  }
+  if (activeDeltaConsoleKey !== key) {
+    ensureDeltaConsoleClosed();
+    activeDeltaConsoleKey = key;
+    activeDeltaConsoleTrailingNewline = true;
+    console.log(`${consoleTime()} [delta] ${key}`);
+  }
+  process.stdout.write(chunk);
+  activeDeltaConsoleTrailingNewline = /[\r\n]$/.test(chunk);
+}
+function flushResponseDeltaConsole(taskKey, itemId) {
+  const key = `${taskKey}__${itemId}`;
+  if (activeDeltaConsoleKey !== key) {
+    return;
+  }
+  ensureDeltaConsoleClosed();
+}
+function ensureDeltaConsoleClosed() {
+  if (!activeDeltaConsoleKey) {
+    return;
+  }
+  if (!activeDeltaConsoleTrailingNewline) {
+    process.stdout.write("\n");
+  }
+  activeDeltaConsoleKey = null;
+  activeDeltaConsoleTrailingNewline = true;
+}
 function taskInstanceId(taskKey, itemId) { return `${taskKey}__${itemId}`; }
-function aiCacheKey(taskKey, meta) { return crypto.createHash("sha256").update(JSON.stringify({ taskKey, model: meta.model, inputHash: meta.inputHash, promptHash: meta.promptHash, taskVersion: 1, outputSchemaVersion: 1 })).digest("hex"); }
+function aiCacheKey(taskKey, meta) { return crypto.createHash("sha256").update(JSON.stringify({ taskKey, model: meta.model, think: meta.think ?? null, inputHash: meta.inputHash, promptHash: meta.promptHash, taskVersion: 1, outputSchemaVersion: 1 })).digest("hex"); }
 function resolveModelForTask(runtime, taskKey) { return runtime.config.taskModels?.[taskKey] || runtime.config.model; }
+function resolveThinkForTask(runtime, taskKey) {
+  const taskThink = runtime.config.taskThinks?.[taskKey];
+  if (typeof taskThink === "boolean") {
+    return taskThink;
+  }
+  const provider = resolveRuntimeProvider(runtime.config);
+  if (provider !== "ollama") {
+    return null;
+  }
+  const runtimeThink = runtime.config.runtime?.ollama?.think;
+  return typeof runtimeThink === "boolean" ? runtimeThink : null;
+}
 function readState(runtime, taskKey, itemId) { return readJson(path.join(runtime.paths.state, `${taskKey}__${itemId}.json`)); }
 function writeState(runtime, definition, itemId, patch) { writeJson(path.join(runtime.paths.state, `${definition.taskKey}__${itemId}.json`), { schemaVersion: 1, runId: runtime.config.runId, taskKey: definition.taskKey, itemType: definition.itemType, itemId, taskVersion: 1, outputSchemaVersion: 1, ...patch }); }
 function listZipEntries(zipPath) { return execFileAsync("tar", ["-tf", zipPath], { windowsHide: true, maxBuffer: 1024 * 1024 * 64 }).then(({ stdout }) => stdout.split(/\r?\n/).filter(Boolean)); }
@@ -1843,6 +1947,9 @@ async function createAgentClient(config) {
   if (provider === "copilot") {
     return CopilotAppServerClient.create(config);
   }
+  if (provider === "ollama") {
+    return OllamaClient.create(config);
+  }
   return AppServerClient.create(config);
 }
 
@@ -1850,13 +1957,21 @@ function resolveRuntimeProvider(config) {
   if (config.runtime?.provider === "copilot" || config.provider === "copilot") {
     return "copilot";
   }
+  if (config.runtime?.provider === "ollama" || config.provider === "ollama") {
+    return "ollama";
+  }
   return "codex";
 }
 
 function normalizeAgentRuntimeConfig(config, provider) {
   const runtime = config.runtime && typeof config.runtime === "object" && !Array.isArray(config.runtime) ? config.runtime : {};
+  const resolvedProvider = runtime.provider === "copilot" || provider === "copilot"
+    ? "copilot"
+    : runtime.provider === "ollama" || provider === "ollama"
+      ? "ollama"
+      : "codex";
   return {
-    provider: runtime.provider === "copilot" || provider === "copilot" ? "copilot" : "codex",
+    provider: resolvedProvider,
     codex: normalizeProviderOptions(runtime.codex, {
       transport: "stdio",
       command: undefined,
@@ -1873,6 +1988,14 @@ function normalizeAgentRuntimeConfig(config, provider) {
       args: ["--acp", "--stdio"],
       cwd: process.cwd(),
       env: null
+    }),
+    ollama: normalizeProviderOptions(runtime.ollama, {
+      baseUrl: "http://127.0.0.1:11434",
+      keepAlive: "5m",
+      think: null,
+      headers: null,
+      options: null,
+      system: null
     })
   };
 }
@@ -2257,6 +2380,194 @@ class CopilotAppServerClient {
 
   async close() {
     await this.rpc.close();
+  }
+}
+
+class OllamaClient {
+  static async create(config) {
+    return new OllamaClient(config);
+  }
+
+  constructor(config) {
+    this.config = config;
+    this.ollama = config.runtime?.ollama || {};
+    this.baseUrl = String(this.ollama.baseUrl || "http://127.0.0.1:11434").replace(/\/+$/, "");
+    this.eventLogPath = path.join(config.outputDir, "logs", "ollama-events.log");
+  }
+
+  async runJsonTurn({ model, think, cwd, prompt, onProgress }) {
+    const preview = clip(prompt.replace(/\s+/g, " "), 220);
+    const sentAt = isoJst();
+    const finalModel = model || this.config.model;
+    const systemPrompt = this.ollama.system || [
+      "常に日本語で応答してください。",
+      "最終応答は JSON オブジェクトのみ。",
+      "説明文、コードブロック、前置きは禁止。"
+    ].join("\n");
+    const body = {
+      model: finalModel,
+      system: systemPrompt,
+      prompt,
+      stream: true
+    };
+
+    if (this.ollama.keepAlive) {
+      body.keep_alive = this.ollama.keepAlive;
+    }
+    if (typeof think === "boolean") {
+      body.think = think;
+    } else if (typeof this.ollama.think === "boolean") {
+      body.think = this.ollama.think;
+    }
+    if (this.ollama.options && typeof this.ollama.options === "object" && !Array.isArray(this.ollama.options)) {
+      body.options = this.ollama.options;
+    }
+
+    onProgress?.({ phase: "turn-start", promptPreview: preview, sentAt, note: "Ollama にプロンプト送信中" });
+    this.log({ phase: "request", model: finalModel, cwd, promptPreview: preview, think: typeof body.think === "boolean" ? body.think : null });
+
+    const response = await fetch(`${this.baseUrl}/api/generate`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...normalizeHeaders(this.ollama.headers)
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      this.log({ phase: "response", status: response.status, ok: response.ok, preview: clip(text, 500) });
+      throw new Error(extractOllamaErrorMessage(response.status, text));
+    }
+    onProgress?.({ phase: "waiting", promptPreview: preview, sentAt, note: "Ollama 応答を待機中" });
+    const streamed = await readOllamaStream(response, { preview, sentAt, onProgress, log: (entry) => this.log(entry) });
+    const output = streamed.output;
+    const thinkingText = streamed.thinking;
+    if (!output) {
+      throw new Error("Ollama から最終応答を取得できませんでした。");
+    }
+
+    onProgress?.({ phase: "done", promptPreview: preview, sentAt, note: "最終応答の取得完了" });
+    return output;
+  }
+
+  async close() {}
+
+  log(entry) {
+    ensureDir(path.dirname(this.eventLogPath));
+    fs.appendFileSync(this.eventLogPath, `${JSON.stringify({ at: isoJst(), provider: "ollama", ...entry })}\n`, "utf8");
+  }
+}
+
+function normalizeHeaders(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, entry]) => typeof entry === "string" || typeof entry === "number" || typeof entry === "boolean")
+      .map(([key, entry]) => [key, String(entry)])
+  );
+}
+
+function extractOllamaErrorMessage(status, text) {
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed?.error) {
+      return `Ollama error (${status}): ${parsed.error}`;
+    }
+  } catch {}
+  return `Ollama error (${status}): ${clip(text || "unknown error", 400)}`;
+}
+
+async function readOllamaStream(response, context) {
+  if (!response.body) {
+    throw new Error("Ollama のストリームを取得できませんでした。");
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let output = "";
+  let thinking = "";
+  let sawDone = false;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    let newlineIndex = buffer.indexOf("\n");
+    while (newlineIndex >= 0) {
+      const line = buffer.slice(0, newlineIndex).trim();
+      buffer = buffer.slice(newlineIndex + 1);
+      if (line) {
+        const chunk = parseOllamaStreamChunk(line);
+        sawDone ||= Boolean(chunk.done);
+        const thinkingChunk = typeof chunk.thinking === "string"
+          ? chunk.thinking
+          : typeof chunk.message?.thinking === "string"
+            ? chunk.message.thinking
+            : "";
+        const responseChunk = typeof chunk.response === "string"
+          ? chunk.response
+          : typeof chunk.message?.content === "string"
+            ? chunk.message.content
+            : "";
+        if (thinkingChunk) {
+          thinking += thinkingChunk;
+          context.log({ phase: "thinking-chunk", preview: clip(thinkingChunk, 200) });
+          context.onProgress?.({ phase: "thinking", promptPreview: context.preview, sentAt: context.sentAt, note: `thinking: ${clip(thinkingChunk, 80)}`, thinkingText: thinkingChunk });
+        }
+        if (responseChunk) {
+          output += responseChunk;
+          context.log({ phase: "response-chunk", preview: clip(responseChunk, 200) });
+          context.onProgress?.({ phase: "agent-message", promptPreview: context.preview, sentAt: context.sentAt, note: `応答生成中: ${clip(responseChunk, 80)}`, deltaText: responseChunk });
+        }
+      }
+      newlineIndex = buffer.indexOf("\n");
+    }
+  }
+
+  const tail = buffer.trim();
+  if (tail) {
+    const chunk = parseOllamaStreamChunk(tail);
+    sawDone ||= Boolean(chunk.done);
+    const thinkingChunk = typeof chunk.thinking === "string"
+      ? chunk.thinking
+      : typeof chunk.message?.thinking === "string"
+        ? chunk.message.thinking
+        : "";
+    const responseChunk = typeof chunk.response === "string"
+      ? chunk.response
+      : typeof chunk.message?.content === "string"
+        ? chunk.message.content
+        : "";
+    if (thinkingChunk) {
+      thinking += thinkingChunk;
+      context.log({ phase: "thinking-chunk", preview: clip(thinkingChunk, 200) });
+      context.onProgress?.({ phase: "thinking", promptPreview: context.preview, sentAt: context.sentAt, note: `thinking: ${clip(thinkingChunk, 80)}`, thinkingText: thinkingChunk });
+    }
+    if (responseChunk) {
+      output += responseChunk;
+      context.log({ phase: "response-chunk", preview: clip(responseChunk, 200) });
+      context.onProgress?.({ phase: "agent-message", promptPreview: context.preview, sentAt: context.sentAt, note: `応答生成中: ${clip(responseChunk, 80)}`, deltaText: responseChunk });
+    }
+  }
+
+  context.log({ phase: "response", ok: true, done: sawDone, preview: clip(output, 500) });
+  if (thinking) {
+    context.log({ phase: "thinking", preview: clip(thinking, 500) });
+  }
+  return { output, thinking, done: sawDone };
+}
+
+function parseOllamaStreamChunk(line) {
+  try {
+    return JSON.parse(line);
+  } catch (error) {
+    throw new Error(`Ollama のストリーム JSON を解析できませんでした: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 

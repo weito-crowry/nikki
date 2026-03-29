@@ -42,6 +42,7 @@ function resolveConfig(options, positionals = []) {
     grouping: options["group-by"] ?? fileConfig.grouping ?? "thread-start-day",
     model: options.model ?? fileConfig.model ?? "gpt-5.4",
     taskModels: normalizeTaskModels(fileConfig.taskModels),
+    taskThinks: normalizeTaskThinks(fileConfig.taskThinks),
     maxCategories: Number(options["max-categories"] ?? fileConfig.maxCategories ?? 12),
     categoriesPerMessage: Number(options["categories-per-message"] ?? fileConfig.categoriesPerMessage ?? 2),
     summaryLanguage: options.language ?? fileConfig.summaryLanguage ?? "ja",
@@ -106,14 +107,46 @@ function normalizeTaskModels(value) {
   );
 }
 
+function normalizeTaskThinks(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key, think]) => key && typeof normalizeBooleanValue(think) === "boolean")
+      .map(([key, think]) => [String(key), normalizeBooleanValue(think)])
+  );
+}
+
+function normalizeBooleanValue(value) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "string") {
+    if (value.toLowerCase() === "true") {
+      return true;
+    }
+    if (value.toLowerCase() === "false") {
+      return false;
+    }
+  }
+  return null;
+}
+
 function normalizeRuntimeConfig(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
   }
+  const provider = value.provider === "copilot"
+    ? "copilot"
+    : value.provider === "ollama"
+      ? "ollama"
+      : "codex";
   return {
-    provider: value.provider === "copilot" ? "copilot" : "codex",
+    provider,
     codex: normalizeProviderOptions(value.codex),
-    copilot: normalizeProviderOptions(value.copilot)
+    copilot: normalizeProviderOptions(value.copilot),
+    ollama: normalizeProviderOptions(value.ollama)
   };
 }
 
@@ -135,7 +168,7 @@ function normalizeProviderOptions(value) {
       result[key] = Object.fromEntries(
         Object.entries(entry)
           .filter(([, nested]) => typeof nested === "string" || typeof nested === "number" || typeof nested === "boolean")
-          .map(([nestedKey, nested]) => [nestedKey, String(nested)])
+          .map(([nestedKey, nested]) => [nestedKey, nested])
       );
     }
   }

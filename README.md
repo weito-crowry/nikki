@@ -23,6 +23,7 @@ OpenAI エクスポート ZIP から日記を生成する CLI です。
 - `npm install` 済み
 - Codex 利用時は `codex` コマンド
 - Copilot 利用時は `copilot --acp --stdio` が使えること
+- Ollama 利用時は [Ollama](https://ollama.com/) が起動していて `http://127.0.0.1:11434` へ到達できること
 - PDF 出力はローカルの Edge / Chrome を自動検出
 
 ## インストール
@@ -61,6 +62,19 @@ Copilot 設定の実行例:
 npm run run:prod:copilot
 ```
 
+Ollama 設定ファイルの例:
+
+```bash
+node src/cli.js run --config ./nikki.config.ollama.example.json
+```
+
+Qwen 3.5 0.8B の試行用:
+
+```bash
+ollama pull qwen3.5:0.8b
+npm run run:prod:ollama:qwen3.5-0.8b
+```
+
 ## 主な設定
 
 設定ファイルでは主に以下を使います。
@@ -72,6 +86,7 @@ npm run run:prod:copilot
 - `grouping`
 - `model`
 - `taskModels`
+- `taskThinks`
 - `maxCategories`
 - `summaryLanguage`
 - `freezeCategories`
@@ -106,6 +121,33 @@ npm run run:prod:copilot
     "thread_000001",
     "thread_000002"
   ]
+}
+```
+
+Ollama の例:
+
+```json
+{
+  "zipPath": "./export.zip",
+  "outputDir": "./output/run-ollama",
+  "provider": "ollama",
+  "runtime": {
+    "provider": "ollama",
+    "ollama": {
+      "baseUrl": "http://127.0.0.1:11434",
+      "keepAlive": "5m",
+      "think": false
+    }
+  },
+  "model": "qwen3.5:2b",
+  "taskThinks": {
+    "ai.generate_category_candidates": false,
+    "ai.classify_thread": false,
+    "ai.extract_findings": false,
+    "ai.summarize_unit": true,
+    "ai.write_diary_entry": true,
+    "ai.rewrite_diary_entry": false
+  }
 }
 ```
 

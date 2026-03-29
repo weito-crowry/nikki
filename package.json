@@ -1,0 +1,24 @@
+{
+  "name": "nikki-export-diary",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "nikki": "node src/cli.js",
+    "run:prod": "node src/cli.js run --config ./nikki.config.prod.json",
+    "run:prod:resume": "node src/cli.js run --config ./nikki.config.prod.json --skip-completed",
+    "run:prod:force": "node src/cli.js run --config ./nikki.config.prod.json --force",
+    "run:prod:inspect": "node src/cli.js inspect --config ./nikki.config.prod.json",
+    "run:prod:copilot": "node src/cli.js run --config ./nikki.config.prod.copilot.json",
+    "run:prod:copilot:resume": "node src/cli.js run --config ./nikki.config.prod.copilot.json --skip-completed",
+    "run:prod:copilot:force": "node src/cli.js run --config ./nikki.config.prod.copilot.json --force",
+    "run:prod:copilot:inspect": "node src/cli.js inspect --config ./nikki.config.prod.copilot.json",
+    "test:smoke": "node src/cli.js inspect --zip \"./e64f0a16abb95f3c70f239cf9594ac82de32b79111df3299d462d34532a6e805-2026-02-28-08-08-03-106f1c6793ee45fb8cef5be87ad4356a.zip\"",
+    "test:fixture:inspect": "node src/cli.js inspect --zip \"./test-fixtures/minimal-export.zip\"",
+    "test:fixture:run": "node src/cli.js run --zip \"./test-fixtures/minimal-export.zip\" --output \"./tmp/runs/minimal-run\" --limit 1",
+    "test:fixture:resume": "node src/cli.js run --zip \"./test-fixtures/minimal-export.zip\" --output \"./tmp/runs/minimal-run\" --limit 1 --skip-completed"
+  },
+  "dependencies": {
+    "marked": "^15.0.7"
+  }
+}

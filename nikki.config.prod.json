@@ -1,0 +1,18 @@
+{
+  "zipPath": "./e64f0a16abb95f3c70f239cf9594ac82de32b79111df3299d462d34532a6e805-2026-02-28-08-08-03-106f1c6793ee45fb8cef5be87ad4356a.zip",
+  "outputDir": "./output/prod-main",
+  "grouping": "thread-start-day",
+  "model": "gpt-5.4",
+  "taskModels": {
+    "ai.generate_category_candidates": "gpt-5.4-mini",
+    "ai.classify_thread": "gpt-5.4-mini",
+    "ai.extract_findings": "gpt-5.4-mini",
+    "ai.summarize_unit": "gpt-5.4-mini",
+    "ai.write_diary_entry": "gpt-5.4",
+    "ai.rewrite_diary_entry": "gpt-5.4"
+  },
+  "maxCategories": 12,
+  "categoriesPerMessage": 2,
+  "summaryLanguage": "ja",
+  "force": false
+}

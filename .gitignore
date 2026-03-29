@@ -1,0 +1,8 @@
+node_modules/
+output/
+tmp/
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+*.zip

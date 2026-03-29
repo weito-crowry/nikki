@@ -1,0 +1,69 @@
+{
+  "zipPath": "./e64f0a16abb95f3c70f239cf9594ac82de32b79111df3299d462d34532a6e805-2026-02-28-08-08-03-106f1c6793ee45fb8cef5be87ad4356a.zip",
+  "outputDir": "./output/prod-main-copilot",
+  "grouping": "thread-start-day",
+  "provider": "copilot",
+  "runtime": {
+    "provider": "copilot",
+    "copilot": {
+      "transport": "stdio",
+      "command": "copilot",
+      "args": [
+        "--acp",
+        "--stdio"
+      ]
+    },
+    "codex": {
+      "transport": "stdio",
+      "command": "codex",
+      "args": [
+        "app-server"
+      ]
+    }
+  },
+  "model": "gpt-5-mini",
+  "taskModels": {
+    "ai.generate_category_candidates": "gpt-5-mini",
+    "ai.classify_thread": "gpt-5-mini",
+    "ai.extract_findings": "gpt-5-mini",
+    "ai.summarize_unit": "gpt-5-mini",
+    "ai.write_diary_entry": "gpt-5-mini",
+    "ai.rewrite_diary_entry": "gpt-5-mini"
+  },
+  "maxCategories": 12,
+  "categoriesPerMessage": 2,
+  "summaryLanguage": "ja",
+  "force": false,
+  "targetThreadItemIds": [
+    "thread_000001",
+    "thread_000002",
+    "thread_000003",
+    "thread_000004",
+    "thread_000005",
+    "thread_000006",
+    "thread_000007",
+    "thread_000008",
+    "thread_000009",
+    "thread_000010",
+    "thread_000011",
+    "thread_000012",
+    "thread_000013",
+    "thread_000014",
+    "thread_000015",
+    "thread_000016",
+    "thread_000017",
+    "thread_000018",
+    "thread_000019",
+    "thread_000020",
+    "thread_000021",
+    "thread_000022",
+    "thread_000023",
+    "thread_000024",
+    "thread_000025",
+    "thread_000026",
+    "thread_000027",
+    "thread_000028",
+    "thread_000029",
+    "thread_000030"
+  ]
+}

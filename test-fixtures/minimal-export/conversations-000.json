@@ -1,0 +1,113 @@
+[
+  {
+    "id": "conv-min-001",
+    "conversation_id": "conv-min-001",
+    "title": "Node.js の日付整形を確認",
+    "create_time": 1707526800,
+    "update_time": 1707526920,
+    "mapping": {
+      "root": {
+        "id": "root",
+        "message": null,
+        "parent": null,
+        "children": [
+          "m1"
+        ]
+      },
+      "m1": {
+        "id": "m1",
+        "parent": "root",
+        "children": [
+          "m2"
+        ],
+        "message": {
+          "id": "msg-user-001",
+          "author": {
+            "role": "user",
+            "name": null
+          },
+          "create_time": 1707526800,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Node.js で JST の YYYY-MM-DD を安全に出す方法を知りたい。"
+            ]
+          },
+          "metadata": {
+            "attachments": []
+          }
+        }
+      },
+      "m2": {
+        "id": "m2",
+        "parent": "m1",
+        "children": [
+          "m3"
+        ],
+        "message": {
+          "id": "msg-assistant-001",
+          "author": {
+            "role": "assistant",
+            "name": null
+          },
+          "create_time": 1707526860,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Intl.DateTimeFormat を timeZone: 'Asia/Tokyo' 付きで使う方法が安全です。"
+            ]
+          },
+          "metadata": {
+            "attachments": []
+          }
+        }
+      },
+      "m3": {
+        "id": "m3",
+        "parent": "m2",
+        "children": [
+          "m4"
+        ],
+        "message": {
+          "id": "msg-user-002",
+          "author": {
+            "role": "user",
+            "name": null
+          },
+          "create_time": 1707526890,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "ありがとう。サンプルコードも短く欲しい。"
+            ]
+          },
+          "metadata": {
+            "attachments": []
+          }
+        }
+      },
+      "m4": {
+        "id": "m4",
+        "parent": "m3",
+        "children": [],
+        "message": {
+          "id": "msg-assistant-002",
+          "author": {
+            "role": "assistant",
+            "name": null
+          },
+          "create_time": 1707526920,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "const ymd = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Tokyo' }).format(new Date());"
+            ]
+          },
+          "metadata": {
+            "attachments": []
+          }
+        }
+      }
+    }
+  }
+]

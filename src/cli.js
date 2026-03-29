@@ -50,6 +50,7 @@ function resolveConfig(options, positionals = []) {
     retryFailed: Boolean(options["retry-failed"] ?? fileConfig.retryFailed ?? false),
     skipCompleted: Boolean(options["skip-completed"] ?? fileConfig.skipCompleted ?? false),
     only: splitList(options.only ?? fileConfig.only ?? null),
+    rerunScopes: splitList(options["rerun-scope"] ?? fileConfig.rerunScopes ?? null),
     itemIds: splitList(options["item-id"] ?? fileConfig.itemIds ?? null),
     targetThreadItemIds: splitList(options["thread-id"] ?? fileConfig.targetThreadItemIds ?? null),
     date: options.date ?? fileConfig.date ?? null,
@@ -70,7 +71,7 @@ function resolveConfig(options, positionals = []) {
 function printUsage() {
   console.log(`使い方:
   node src/cli.js run --zip <zip> --output <dir> [--group-by thread-start-day|message-day|category] [--force]
-    [--only <taskKey[,taskKey...]>] [--item-id <id[,id...]>] [--thread-id <id[,id...]>] [--date YYYY-MM-DD] [--limit N]
+    [--only <taskKey[,taskKey...]>] [--rerun-scope <thread[,unit]>] [--item-id <id[,id...]>] [--thread-id <id[,id...]>] [--date YYYY-MM-DD] [--limit N]
     [--retry-failed] [--skip-completed] [--freeze-categories]
   node src/cli.js inspect --zip <zip>
   node src/cli.js run --config ./nikki.config.json`);

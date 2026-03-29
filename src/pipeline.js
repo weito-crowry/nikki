@@ -210,8 +210,14 @@ async function executeTask(runtime, definition, item) {
   const instanceId = taskInstanceId(definition.taskKey, item.itemId);
   runtime.current = { stage: definition.stage, taskKey: definition.taskKey, itemType: definition.itemType, itemId: item.itemId, taskInstanceId: instanceId, promptPreview: null, sentAt: null, lastEvent: null, note: null };
   const meta = await buildTaskMeta(runtime, definition, item);
-  const state = readState(runtime, definition.taskKey, item.itemId);
   const dependsOn = resolveDependsOn(runtime, definition.taskKey, item.itemId);
+  let state = readState(runtime, definition.taskKey, item.itemId);
+  const migration = migrateReusableState(runtime, definition, item, state, meta, dependsOn);
+  if (migration) {
+    state = migration.state;
+    emitEvent(runtime, { type: "task.state_migrated", stage: definition.stage, taskKey: definition.taskKey, itemType: definition.itemType, itemId: item.itemId, taskInstanceId: instanceId, note: migration.note });
+    logConsole("migr ", instanceId, migration.note);
+  }
   const invalidation = getInvalidation(runtime, definition, item, state, meta, dependsOn);
   const canReuse = reusable(state, runtime, definition, item, meta, dependsOn, invalidation);
 
@@ -293,12 +299,23 @@ async function buildTaskMeta(runtime, definition, item) {
     }
     case "analyze.group_units":
       return { inputHash: hashJson({ grouping: runtime.config.grouping, targetThreadItemIds: runtime.config.targetThreadItemIds || null, threads: loadScopedThreadIndex(runtime), classifications: [...loadScopedClassifications(runtime).entries()] }), promptHash: null, model: null, promptPreview: null };
-    case "ai.summarize_unit": {
-      const unit = readUnit(runtime, item.itemId);
-      const payload = { grouping: runtime.config.grouping, unit, threads: unit.threadItemIds.map((threadItemId) => readThread(threadItemId)), classifications: unit.threadItemIds.map((threadItemId) => readArtifact(runtime, `artifacts/ai/thread_classification/${threadItemId}.json`)), findings: unit.threadItemIds.map((threadItemId) => readArtifact(runtime, `artifacts/ai/thread_findings/${threadItemId}.json`)) };
-      const prompt = [`単位: ${unit.itemId}`, `表示名: ${unit.label}`, "以下の情報から日記用の unit 要約を作成してください。", "出力は JSON のみ。", '{"summaryTitle":"見出し","interests":["..."],"questions":["..."],"outcomes":["..."],"images":[{"path":"...","prompt":"...","note":"..."}],"narrative":"2-5文の要約"}', JSON.stringify(payload, null, 2)].join("\n\n");
-      return aiMeta(runtime, prompt, payload);
-    }
+      case "ai.summarize_unit": {
+        const unit = readUnit(runtime, item.itemId);
+        const availableThreadItemIds = (unit.threadItemIds || []).filter((threadItemId) => hasThreadSummaryInputs(runtime, threadItemId));
+        const payload = {
+          grouping: runtime.config.grouping,
+          unit: {
+            ...unit,
+            threadItemIds: availableThreadItemIds,
+            omittedThreadItemIds: (unit.threadItemIds || []).filter((threadItemId) => !availableThreadItemIds.includes(threadItemId))
+          },
+          threads: availableThreadItemIds.map((threadItemId) => readThread(threadItemId)),
+          classifications: availableThreadItemIds.map((threadItemId) => readArtifact(runtime, `artifacts/ai/thread_classification/${threadItemId}.json`)),
+          findings: availableThreadItemIds.map((threadItemId) => readArtifact(runtime, `artifacts/ai/thread_findings/${threadItemId}.json`))
+        };
+        const prompt = [`単位: ${unit.itemId}`, `表示名: ${unit.label}`, "以下の情報から日記用の unit 要約を作成してください。", "出力は JSON のみ。", '{"summaryTitle":"見出し","interests":["..."],"questions":["..."],"outcomes":["..."],"images":[{"path":"...","prompt":"...","note":"..."}],"narrative":"2-5文の要約"}', JSON.stringify(payload, null, 2)].join("\n\n");
+        return aiMeta(runtime, prompt, payload);
+      }
     case "ai.write_diary_entry": {
       const entry = readEntry(runtime, item.itemId);
       const prompt = [`日記エントリID: ${entry.itemId}`, `対象日付: ${entry.date}`, "以下の unit 要約から、その日の日記本文草稿を作ってください。", "出力は JSON のみ。", '{"title":"見出し","lead":"導入","sections":[{"heading":"見出し","body":"本文"}],"closing":"締め","images":[{"path":"...","caption":"..."}]}', JSON.stringify(entry, null, 2)].join("\n\n");
@@ -784,7 +801,7 @@ function resolveDependsOn(runtime, taskKey, itemId) {
     if (!runtime.config.targetThreadItemIds?.length) return true;
     return runtime.config.targetThreadItemIds.includes(thread.itemId);
   }).flatMap((thread) => [taskInstanceId("ai.classify_thread", thread.itemId), taskInstanceId("ai.extract_findings", thread.itemId)]);
-  if (taskKey === "ai.summarize_unit") return [taskInstanceId("analyze.group_units", "run"), ...readUnit(runtime, itemId).threadItemIds.flatMap((threadItemId) => [taskInstanceId("ai.classify_thread", threadItemId), taskInstanceId("ai.extract_findings", threadItemId)])];
+  if (taskKey === "ai.summarize_unit") return readUnit(runtime, itemId).threadItemIds.filter((threadItemId) => hasThreadSummaryInputs(runtime, threadItemId)).flatMap((threadItemId) => [taskInstanceId("ai.classify_thread", threadItemId), taskInstanceId("ai.extract_findings", threadItemId)]);
   if (taskKey === "ai.write_diary_entry") return readEntry(runtime, itemId).unitSummaries.map((unitSummary) => taskInstanceId("ai.summarize_unit", unitSummary.itemId));
   if (taskKey === "ai.rewrite_diary_entry") return [taskInstanceId("ai.write_diary_entry", itemId)];
   if (taskKey === "render.markdown") return loadDiaryEntries(runtime).map((entry) => taskInstanceId("ai.rewrite_diary_entry", entry.itemId));
@@ -795,8 +812,9 @@ function resolveDependsOn(runtime, taskKey, itemId) {
 
 function reusable(state, runtime, definition, item, meta, dependsOn, invalidation) {
   if (runtime.config.force || !state || state.status !== "completed") return false;
-  if (shouldRerunExplicitItem(runtime, item)) return false;
+  if (shouldRerunExplicitSelection(runtime, definition, item)) return false;
   if (invalidation) return false;
+  if (isPersistentAiTask(definition)) return hasArtifacts(runtime, state.artifactPaths);
   if (runtime.config.skipCompleted) return hasArtifacts(runtime, state.artifactPaths);
   if (state.inputHash !== meta.inputHash) return false;
   if (definition.isAi && (state.promptHash !== meta.promptHash || state.model !== meta.model)) return false;
@@ -811,14 +829,25 @@ function getInvalidation(runtime, definition, item, state, meta, dependsOn) {
   if (runtime.config.force) {
     return { reason: "--force により再実行します" };
   }
-  if (shouldRerunExplicitItem(runtime, item)) {
-    return { reason: "--item-id 指定により対象 item を再実行します" };
+  if (shouldRerunExplicitSelection(runtime, definition, item)) {
+    if (shouldRerunExplicitItem(runtime, item)) {
+      return { reason: "--item-id 指定により対象 item を再実行します" };
+    }
+    if (shouldRerunExplicitDate(runtime, definition, item)) {
+      return { reason: `--date ${runtime.config.date} 指定により対象日付を再実行します` };
+    }
   }
   if (state.status === "running") {
     return { reason: "前回実行が running のまま終了していたため再実行します" };
   }
   if (state.status === "failed") {
     return { reason: runtime.config.retryFailed ? "failed task を再試行します" : "failed task を再実行します" };
+  }
+  if (state.status === "completed" && isPersistentAiTask(definition)) {
+    if (!hasArtifacts(runtime, state.artifactPaths)) {
+      return { reason: "必要 artifact が欠落しているため再実行します" };
+    }
+    return null;
   }
   if (runtime.changed.size > 0 && dependsOn.some((dependency) => runtime.changed.has(dependency) || runtime.invalidated.has(dependency))) {
     return { reason: "依存 task が変更されたため再実行します" };
@@ -843,8 +872,66 @@ function getInvalidation(runtime, definition, item, state, meta, dependsOn) {
   return null;
 }
 
+function isPersistentAiTask(definition) {
+  return Boolean(definition?.isAi && [
+    "ai.classify_thread",
+    "ai.extract_findings",
+    "ai.summarize_unit",
+    "ai.write_diary_entry",
+    "ai.rewrite_diary_entry"
+  ].includes(definition.taskKey));
+}
+
 function hasArtifacts(runtime, artifactPaths) {
   return Array.isArray(artifactPaths) && artifactPaths.length > 0 && artifactPaths.every((relativePath) => fs.existsSync(path.join(runtime.paths.root, relativePath)));
+}
+
+function migrateReusableState(runtime, definition, item, state, meta, dependsOn) {
+  if (!state || state.status !== "completed") {
+    return null;
+  }
+  if (!hasArtifacts(runtime, state.artifactPaths)) {
+    return null;
+  }
+  if (definition.taskKey === "ai.classify_thread" && runtime.config.freezeCategories) {
+    const legacyDependency = taskInstanceId("ai.generate_category_candidates", "run");
+    const currentDependsOn = Array.isArray(state.dependsOn) ? state.dependsOn : [];
+    const withoutLegacy = currentDependsOn.filter((dependency) => dependency !== legacyDependency);
+    const canMigrate = currentDependsOn.includes(legacyDependency)
+      && sameArray(withoutLegacy, dependsOn)
+      && state.model === meta.model
+      && state.promptHash === meta.promptHash
+      && state.inputHash === meta.inputHash;
+    if (canMigrate) {
+      const nextState = { ...state, dependsOn };
+      writeState(runtime, definition, item.itemId, nextState);
+      return {
+        state: nextState,
+        note: "過去の分類成果物を freezeCategories 互換の state に変換して再利用します"
+      };
+    }
+    const classificationArtifact = readArtifact(runtime, `artifacts/ai/thread_classification/${item.itemId}.json`);
+    const categoryIds = new Set((readCategoryMaster(runtime)?.categories || []).map((category) => category.id));
+    const usedCategoryIds = [classificationArtifact?.primary, ...(classificationArtifact?.secondary || [])].filter(Boolean);
+    const canCompatMigrate = classificationArtifact
+      && state.model === meta.model
+      && usedCategoryIds.length > 0
+      && usedCategoryIds.every((categoryId) => categoryIds.has(categoryId));
+    if (canCompatMigrate) {
+      const nextState = {
+        ...state,
+        dependsOn,
+        inputHash: meta.inputHash,
+        promptHash: meta.promptHash
+      };
+      writeState(runtime, definition, item.itemId, nextState);
+      return {
+        state: nextState,
+        note: "過去の分類成果物を互換変換して再利用します"
+      };
+    }
+  }
+  return null;
 }
 
 function validateRunOptions(runtime) {
@@ -859,6 +946,12 @@ function validateRunOptions(runtime) {
   }
   if (runtime.config.targetThreadItemIds && !Array.isArray(runtime.config.targetThreadItemIds)) {
     throw new Error("targetThreadItemIds は配列で指定してください。");
+  }
+  if (runtime.config.rerunScopes?.length) {
+    const invalid = runtime.config.rerunScopes.filter((scope) => !["thread", "unit"].includes(scope));
+    if (invalid.length) {
+      throw new Error(`rerunScopes には thread, unit のみ指定できます: ${invalid.join(", ")}`);
+    }
   }
 }
 
@@ -885,6 +978,9 @@ function applyItemFilters(runtime, definition, items) {
 }
 
 function matchesOnly(runtime, taskKey) {
+  if (runtime.config.rerunScopes?.length && !matchesRerunScope(taskKey, runtime.config.rerunScopes)) {
+    return false;
+  }
   if (!runtime.config.only?.length) {
     return true;
   }
@@ -893,6 +989,49 @@ function matchesOnly(runtime, taskKey) {
 
 function shouldRerunExplicitItem(runtime, item) {
   return Boolean(item?.itemId && runtime.config.itemIds?.length && runtime.config.itemIds.includes(item.itemId));
+}
+
+function shouldRerunExplicitSelection(runtime, definition, item) {
+  return shouldRerunExplicitItem(runtime, item) || shouldRerunExplicitDate(runtime, definition, item);
+}
+
+function shouldRerunExplicitDate(runtime, definition, item) {
+  if (!runtime.config.date) {
+    return false;
+  }
+  if (runtime.config.rerunScopes?.length && !matchesRerunScope(definition.taskKey, runtime.config.rerunScopes)) {
+    return false;
+  }
+  const meta = item?.meta || item;
+  if (definition.itemType === "run") {
+    return ["analyze.group_units", "render.markdown", "render.html", "render.pdf"].includes(definition.taskKey);
+  }
+  return matchesDateFilter(definition.itemType, meta, runtime.config.date);
+}
+
+function matchesRerunScope(taskKey, scopes) {
+  const allow = new Set(scopes || []);
+  if (!allow.size) {
+    return true;
+  }
+  if (allow.has("thread") && [
+    "ai.classify_thread",
+    "ai.extract_findings"
+  ].includes(taskKey)) {
+    return true;
+  }
+  if (allow.has("unit") && [
+    "analyze.group_units",
+    "ai.summarize_unit",
+    "ai.write_diary_entry",
+    "ai.rewrite_diary_entry",
+    "render.markdown",
+    "render.html",
+    "render.pdf"
+  ].includes(taskKey)) {
+    return true;
+  }
+  return false;
 }
 
 function matchesTargetThreadFilter(itemType, meta, targetThreadItemIds) {
@@ -1031,7 +1170,9 @@ function handleGroupUnits(runtime) {
   const allThreads = readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || [];
   const targetThreadItemIds = new Set(runtime.config.targetThreadItemIds || []);
   const scopedThreads = targetThreadItemIds.size > 0 ? allThreads.filter((thread) => targetThreadItemIds.has(thread.itemId)) : allThreads;
-  const affectedDates = new Set(scopedThreads.map((thread) => thread.primaryDate || "unknown"));
+  const affectedDates = runtime.config.date
+    ? new Set([runtime.config.date])
+    : new Set(scopedThreads.map((thread) => thread.primaryDate || "unknown"));
   const preserved = runtime.config.grouping === "category"
     ? []
     : existing.filter((unit) => !affectedDates.has(unit.date || "unknown"));
@@ -1044,6 +1185,9 @@ function handleGroupUnits(runtime) {
     if (targetThreadItemIds.size > 0 && runtime.config.grouping === "category" && !targetThreadItemIds.has(thread.itemId)) {
       continue;
     }
+    if (targetThreadItemIds.size > 0 && runtime.config.grouping !== "category" && !targetThreadItemIds.has(thread.itemId) && !hasThreadSummaryInputs(runtime, thread.itemId)) {
+      continue;
+    }
     const classification = classes.get(thread.itemId);
     const category = runtime.config.grouping === "category" ? (classification?.primary || "uncategorized") : null;
     const itemId = runtime.config.grouping === "category" ? `unit_category_${category}` : `unit_date_${date}`;
@@ -1052,7 +1196,7 @@ function handleGroupUnits(runtime) {
       buckets.get(itemId).threadItemIds.push(thread.itemId);
     }
   }
-  writeArtifact(runtime, "artifacts/units/units.json", { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, unitStrategy: runtime.config.grouping === "category" ? "category" : "date", items: [...buckets.values()].sort((a, b) => a.itemId.localeCompare(b.itemId, "ja")) });
+  writeArtifact(runtime, "artifacts/units/units.json", { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, unitStrategy: runtime.config.grouping === "category" ? "category" : "date", items: [...buckets.values()].filter((unit) => (unit.threadItemIds || []).length > 0).sort((a, b) => a.itemId.localeCompare(b.itemId, "ja")) });
   return ["artifacts/units/units.json"];
 }
 
@@ -1186,18 +1330,26 @@ async function askForJson(runtime, taskKey, itemId, name, meta) {
       runtime.current.sentAt = event.sentAt || runtime.current.sentAt;
       writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: event.promptPreview || runtime.current.promptPreview, sentAt: event.sentAt || runtime.current.sentAt, note: event.note || null, lastEvent: `ai.${event.phase || "progress"}` });
     }
-  }));
+  })).catch((error) => {
+    throw normalizeAiFailure(error);
+  });
   writeRaw(runtime, taskKey, itemId, text);
   const normalized = stripFence(text.trim());
   if (/^Error:/i.test(normalized)) {
-    throw new Error(normalized);
+    throw normalizeAiFailure(new Error(normalized));
   }
   let parsed;
   try {
     parsed = JSON.parse(normalized);
   } catch (error) {
+    const fenced = recoverLastJsonFence(normalized);
+    if (fenced) {
+      try {
+        parsed = JSON.parse(fenced);
+      } catch {}
+    }
     const recovered = recoverJsonObjectText(normalized);
-    if (recovered) {
+    if (!parsed && recovered) {
       try {
         parsed = JSON.parse(recovered);
       } catch {}
@@ -1246,14 +1398,31 @@ async function runAiWithRetry(runtime, taskKey, itemId, run) {
   throw lastError ?? new Error("AI 呼び出しに失敗しました");
 }
 
+function normalizeAiFailure(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (isQuotaExceededFailure(message)) {
+    return new Error(`AI 利用枠が不足しています: quota 切れのため処理を継続できません。${extractRequestId(message) ? ` (${extractRequestId(message)})` : ""}`);
+  }
+  return error instanceof Error ? error : new Error(message);
+}
+
+function isQuotaExceededFailure(message) {
+  return /\b402\b.*\bno quota\b/i.test(String(message || ""));
+}
+
+function extractRequestId(message) {
+  const match = String(message || "").match(/Request ID:\s*([^)]+)/i);
+  return match?.[1]?.trim() || null;
+}
+
 function isRetryableAiText(text) {
   const normalized = String(text || "").trim();
-  return /^Error:/i.test(normalized) && /(429|rate limit|temporar|timeout|ECONNRESET|socket hang up|service unavailable|too many requests)/i.test(normalized);
+  return /^Error:/i.test(normalized) && /(429|rate limit|temporar|timeout|ECONNRESET|socket hang up|service unavailable|too many requests|invalid_request_body|fetch failed|internal error|-32603)/i.test(normalized);
 }
 
 function isRetryableAiFailure(error) {
   const message = error instanceof Error ? error.message : String(error);
-  return /(429|rate limit|temporar|timeout|ECONNRESET|socket hang up|service unavailable|too many requests)/i.test(message);
+  return /(429|rate limit|temporar|timeout|ECONNRESET|socket hang up|service unavailable|too many requests|invalid_request_body|fetch failed|internal error|-32603)/i.test(message);
 }
 
 function isContextOverflowFailure(error) {
@@ -1274,6 +1443,15 @@ function recoverJsonObjectText(text) {
   return text.slice(start, end + 1).trim();
 }
 
+function recoverLastJsonFence(text) {
+  const matches = [...String(text || "").matchAll(/```json\s*([\s\S]*?)\s*```/gi)];
+  if (!matches.length) {
+    return null;
+  }
+  const last = matches[matches.length - 1]?.[1]?.trim();
+  return last || null;
+}
+
 function repairJsonText(text) {
   if (!text) {
     return null;
@@ -1283,6 +1461,8 @@ function repairJsonText(text) {
     .replaceAll("”", "\"")
     .replaceAll("„", "\"")
     .replaceAll("‟", "\"")
+    .replaceAll("「", "\"")
+    .replaceAll("」", "\"")
     .replaceAll("’", "'")
     .replaceAll("‘", "'");
   let result = "";
@@ -1348,6 +1528,12 @@ function loadScopedThreadIndex(runtime) {
   const allow = new Set(runtime.config.targetThreadItemIds);
   return threads.filter((thread) => allow.has(thread.itemId));
 }
+function hasThreadSummaryInputs(runtime, threadItemId) {
+  return Boolean(
+    readArtifact(runtime, `artifacts/ai/thread_classification/${threadItemId}.json`)
+    && readArtifact(runtime, `artifacts/ai/thread_findings/${threadItemId}.json`)
+  );
+}
 function loadClassifications(runtime) { return new Map((readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || []).map((thread) => [thread.itemId, readArtifact(runtime, `artifacts/ai/thread_classification/${thread.itemId}.json`)]).filter(([, value]) => value)); }
 function loadScopedClassifications(runtime) {
   const entries = [...loadClassifications(runtime).entries()];
@@ -1377,23 +1563,32 @@ function getChangedEntryIds(runtime) {
 }
 function draftToMarkdown(draft) { return [draft.lead || "", ...(draft.sections || []).flatMap((section) => [section.heading ? `### ${section.heading}` : "", section.body || "", ""]), draft.closing || ""].filter(Boolean).join("\n\n"); }
 function renderPostSlug(entry) { return sanitizeId(entry.date || entry.itemId || "entry"); }
-function buildEntryMarkdown(entry, navigation = {}) {
+function buildEntryMarkdown(runtime, post, entry, navigation = {}) {
   const navLinks = [
-    navigation.previousPost ? `[前の日: ${navigation.previousPost.date || navigation.previousPost.title}](./${path.posix.basename(navigation.previousPost.htmlPath)})` : null,
-    `[一覧へ](../index.html)`,
-    navigation.nextPost ? `[次の日: ${navigation.nextPost.date || navigation.nextPost.title}](./${path.posix.basename(navigation.nextPost.htmlPath)})` : null
-  ].filter(Boolean);
-  return [
-    `# ${entry.title || entry.itemId}`,
-    "",
-    entry.date ? `- 日付: ${entry.date}` : null,
-    entry.itemId ? `- entryId: ${entry.itemId}` : null,
-    "",
-    navLinks.length ? navLinks.join(" | ") : null,
-    navLinks.length ? "" : null,
-    entry.markdownBody || ""
-  ].filter(Boolean).join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
-}
+      navigation.previousPost ? `[前の日: ${navigation.previousPost.date || navigation.previousPost.title}](./${path.posix.basename(navigation.previousPost.htmlPath)})` : null,
+      `[一覧へ](../index.html)`,
+      navigation.nextPost ? `[次の日: ${navigation.nextPost.date || navigation.nextPost.title}](./${path.posix.basename(navigation.nextPost.htmlPath)})` : null
+    ].filter(Boolean);
+    const imageBlocks = buildEntryImageMarkdown(runtime, post, entry);
+    return [
+      `# ${entry.title || entry.itemId}`,
+      "",
+      entry.date ? `- 日付: ${entry.date}` : null,
+      entry.itemId ? `- entryId: ${entry.itemId}` : null,
+      "",
+      navLinks.length ? navLinks.join(" | ") : null,
+      navLinks.length ? "" : null,
+      entry.markdownBody || "",
+      imageBlocks.length ? "" : null,
+      imageBlocks.length ? "## 生成画像" : null,
+      imageBlocks.length ? "" : null,
+      ...imageBlocks,
+      post.threads?.length ? "" : null,
+      post.threads?.length ? "## 関連スレッド" : null,
+      post.threads?.length ? "" : null,
+      ...(post.threads || []).map((thread) => `- ${thread.itemId}: ${thread.title}${thread.categoryLabel ? ` [${thread.categoryLabel}]` : ""}${thread.chatgptUrl ? ` ([ChatGPTで開く](${thread.chatgptUrl}))` : ""}`)
+    ].filter(Boolean).join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
+  }
 function writeRenderPostsMarkdown(runtime, entries) {
   const postsDir = path.join(runtime.paths.root, "artifacts", "render", "posts");
   ensureDir(postsDir);
@@ -1403,25 +1598,26 @@ function writeRenderPostsMarkdown(runtime, entries) {
   const existingPosts = new Map(((readArtifact(runtime, "artifacts/render/posts.json")?.posts) || []).map((post) => [post.entryId, post]));
   const posts = entries.map((entry) => {
     const slug = renderPostSlug(entry);
-    const markdownPath = `artifacts/render/posts/${slug}.md`;
-    const htmlPath = `artifacts/render/posts/${slug}.html`;
-    const threadItemIds = units.filter((unit) => unit.entryId === entry.itemId).flatMap((unit) => unit.threadItemIds || []);
-    const categories = buildRenderPostCategories(runtime, threadItemIds, categoryMap);
-    const existing = existingPosts.get(entry.itemId);
-    return existing && !changedEntryIds.has(entry.itemId)
-      ? { ...existing, slug, date: entry.date || null, title: entry.title || entry.itemId, markdownPath, htmlPath, categories }
-      : { slug, entryId: entry.itemId, date: entry.date || null, title: entry.title || entry.itemId, markdownPath, htmlPath, categories };
-  });
+      const markdownPath = `artifacts/render/posts/${slug}.md`;
+      const htmlPath = `artifacts/render/posts/${slug}.html`;
+      const threadItemIds = units.filter((unit) => unit.entryId === entry.itemId).flatMap((unit) => unit.threadItemIds || []);
+      const categories = buildRenderPostCategories(runtime, threadItemIds, categoryMap);
+      const threads = buildRenderPostThreads(runtime, threadItemIds, categoryMap);
+      const existing = existingPosts.get(entry.itemId);
+      return existing && !changedEntryIds.has(entry.itemId)
+        ? { ...existing, slug, date: entry.date || null, title: entry.title || entry.itemId, markdownPath, htmlPath, categories, threads }
+        : { slug, entryId: entry.itemId, date: entry.date || null, title: entry.title || entry.itemId, markdownPath, htmlPath, categories, threads };
+    });
   posts.forEach((post, index) => {
     const entry = entries[index];
     const previousPost = index > 0 ? posts[index - 1] : null;
     const nextPost = index < posts.length - 1 ? posts[index + 1] : null;
     if (!existingPosts.has(post.entryId) || changedEntryIds.has(post.entryId)) {
-      fs.writeFileSync(path.join(runtime.paths.root, post.markdownPath), buildEntryMarkdown(entry, { previousPost, nextPost }), "utf8");
-    }
-  });
-  return posts;
-}
+        fs.writeFileSync(path.join(runtime.paths.root, post.markdownPath), buildEntryMarkdown(runtime, post, entry, { previousPost, nextPost }), "utf8");
+      }
+    });
+    return posts;
+  }
 function buildRenderIndexMarkdown(posts) {
   return [
     "# Nikki Blog",
@@ -1431,7 +1627,7 @@ function buildRenderIndexMarkdown(posts) {
     ...posts.map((post) => `- [${post.date || "unknown"} | ${post.title}](./posts/${path.posix.basename(post.htmlPath)})`)
   ].join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
 }
-function buildRenderPostCategories(runtime, threadItemIds, categoryMap) {
+  function buildRenderPostCategories(runtime, threadItemIds, categoryMap) {
   const categories = [];
   const seen = new Set();
   for (const threadItemId of threadItemIds || []) {
@@ -1442,10 +1638,56 @@ function buildRenderPostCategories(runtime, threadItemIds, categoryMap) {
       seen.add(id);
       categories.push({ id, label: categoryMap.get(id) || id });
     }
+    }
+    return categories;
   }
-  return categories;
-}
-function escapeHtml(value) {
+  function buildRenderPostThreads(runtime, threadItemIds, categoryMap) {
+      return (threadItemIds || []).map((threadItemId) => {
+        const thread = readArtifact(runtime, `artifacts/normalized/${threadItemId}.json`) || {};
+        const classification = readArtifact(runtime, `artifacts/ai/thread_classification/${threadItemId}.json`) || {};
+        const categoryId = classification.primary || null;
+        return {
+          itemId: threadItemId,
+          title: thread.title || thread.preview || threadItemId,
+          primaryDate: thread.primaryDate || null,
+          sourceThreadId: thread.sourceThreadId || null,
+          chatgptUrl: thread.sourceThreadId ? `https://chatgpt.com/c/${thread.sourceThreadId}` : null,
+          categoryId,
+          categoryLabel: categoryId ? (categoryMap.get(categoryId) || categoryId) : null
+        };
+      });
+    }
+  function buildEntryImageMarkdown(runtime, post, entry) {
+    const images = normalizeEntryImages(entry);
+    if (!images.length) {
+      return [];
+    }
+    return images.flatMap((image) => {
+      const relativePath = toPostRelativePath(runtime, post, image.path);
+      if (!relativePath) {
+        return [`- ${image.caption || "画像"}: ${image.path}`];
+      }
+      return [
+        image.caption ? `### ${image.caption}` : "### 画像",
+        "",
+        `![${image.caption || "generated image"}](${relativePath})`,
+        ""
+      ];
+    });
+  }
+  function normalizeEntryImages(entry) {
+    return (Array.isArray(entry?.images) ? entry.images : [])
+      .filter((image) => image?.path && fs.existsSync(image.path))
+      .map((image) => ({ path: image.path, caption: image.caption || image.note || "" }));
+  }
+  function toPostRelativePath(runtime, post, targetPath) {
+    if (!targetPath) {
+      return null;
+    }
+    const fromDir = path.join(runtime.paths.root, path.dirname(post.markdownPath || post.htmlPath));
+    return path.relative(fromDir, targetPath).replaceAll("\\", "/");
+  }
+  function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
@@ -1511,27 +1753,61 @@ function wrapBlogIndexHtml(posts) {
   return wrapBlogLayoutHtml(sidebar, content, taxonomy, "Nikki Blog");
 }
 function wrapBlogPostHtml(post, entry, posts) {
-  const currentIndex = posts.findIndex((candidate) => candidate.slug === post.slug);
-  const previousPost = currentIndex > 0 ? posts[currentIndex - 1] : null;
-  const nextPost = currentIndex >= 0 && currentIndex < posts.length - 1 ? posts[currentIndex + 1] : null;
-  const sidebar = buildBlogSidebarHtml(posts, post.slug);
-  const taxonomy = buildBlogCategorySidebarHtml(posts, post);
-  const bodyHtml = marked.parse(entry.markdownBody || "");
-  const content = [
-    `<section class="blog-content-panel">`,
-    buildBlogNavHtml(previousPost, nextPost),
-    `<article class="blog-article">`,
-    `<h1>${escapeHtml(entry.title || post.title)}</h1>`,
-    `<ul class="blog-meta"><li>日付: ${escapeHtml(entry.date || post.date || "unknown")}</li><li>entryId: ${escapeHtml(entry.itemId || post.entryId)}</li></ul>`,
-    bodyHtml,
-    `<section class="blog-post-categories"><h2>カテゴリ</h2><div class="blog-category-chips">${(post.categories || []).map((category) => `<span class="blog-category-chip">${escapeHtml(category.label)}</span>`).join("") || `<span class="blog-category-chip">未分類</span>`}</div></section>`,
-    `</article>`,
-    buildBlogNavHtml(previousPost, nextPost).replace("blog-post-nav", "blog-post-nav bottom"),
-    `</section>`
-  ].join("");
-  return wrapBlogLayoutHtml(sidebar, content, taxonomy, entry.title || post.title || "Nikki Blog");
-}
-function wrapHtml(bodyHtml) { return `<!doctype html><html lang="ja"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Nikki Diary</title><style>:root{--bg:#f5f0e8;--panel:#fffaf3;--ink:#1f1a17;--accent:#a54b2a;--line:#ddcdbd}body{margin:0;font-family:"Yu Mincho","Hiragino Mincho ProN",serif;color:var(--ink);background:radial-gradient(circle at top left,rgba(165,75,42,.10),transparent 28%),linear-gradient(180deg,#f7efe4 0%,#efe5d6 100%)}main{max-width:900px;margin:0 auto;padding:48px 20px 80px}article{background:var(--panel);border:1px solid var(--line);border-radius:20px;box-shadow:0 16px 40px rgba(53,37,24,.08);padding:40px}h1,h2,h3{line-height:1.3}h1{font-size:2.2rem;border-bottom:2px solid var(--accent);padding-bottom:.4em}h2{margin-top:2.4em;color:var(--accent)}p,li{font-size:1rem;line-height:1.9}ul{padding-left:1.4em}@media print{body{background:#fff}main{padding:0}article{box-shadow:none;border:none;border-radius:0;padding:0}}</style></head><body><main><article>${bodyHtml}</article></main></body></html>`; }
+    const currentIndex = posts.findIndex((candidate) => candidate.slug === post.slug);
+    const previousPost = currentIndex > 0 ? posts[currentIndex - 1] : null;
+    const nextPost = currentIndex >= 0 && currentIndex < posts.length - 1 ? posts[currentIndex + 1] : null;
+    const sidebar = buildBlogSidebarHtml(posts, post.slug);
+    const taxonomy = buildBlogCategorySidebarHtml(posts, post);
+    const bodyHtml = marked.parse(entry.markdownBody || "");
+    const imageGalleryHtml = buildBlogImageGalleryHtml(post, entry);
+    const content = [
+      `<section class="blog-content-panel">`,
+      buildBlogNavHtml(previousPost, nextPost),
+      `<article class="blog-article">`,
+      `<h1>${escapeHtml(entry.title || post.title)}</h1>`,
+      `<ul class="blog-meta"><li>日付: ${escapeHtml(entry.date || post.date || "unknown")}</li><li>entryId: ${escapeHtml(entry.itemId || post.entryId)}</li></ul>`,
+      bodyHtml,
+      imageGalleryHtml,
+      buildBlogThreadListHtml(post),
+      `<section class="blog-post-categories"><h2>カテゴリ</h2><div class="blog-category-chips">${(post.categories || []).map((category) => `<span class="blog-category-chip">${escapeHtml(category.label)}</span>`).join("") || `<span class="blog-category-chip">未分類</span>`}</div></section>`,
+      `</article>`,
+      buildBlogNavHtml(previousPost, nextPost).replace("blog-post-nav", "blog-post-nav bottom"),
+      `</section>`
+    ].join("");
+    return wrapBlogLayoutHtml(sidebar, content, taxonomy, entry.title || post.title || "Nikki Blog");
+  }
+  function buildBlogImageGalleryHtml(post, entry) {
+    const images = normalizeEntryImages(entry);
+    if (!images.length) {
+      return "";
+    }
+    return [
+      `<section class="blog-image-gallery">`,
+      `<h2>生成画像</h2>`,
+      `<div class="blog-image-grid">`,
+      ...images.map((image) => {
+        const href = escapeHtml(fileUrl(image.path));
+        const caption = escapeHtml(image.caption || "生成画像");
+        return `<figure class="blog-image-card"><a href="${href}" target="_blank" rel="noreferrer"><img src="${href}" alt="${caption}" loading="lazy" /></a><figcaption>${caption}</figcaption></figure>`;
+      }),
+      `</div>`,
+      `</section>`
+      ].join("");
+  }
+  function buildBlogThreadListHtml(post) {
+    if (!post?.threads?.length) {
+      return "";
+    }
+    return [
+      `<section class="blog-thread-list">`,
+      `<h2>関連スレッド</h2>`,
+      `<ul>`,
+        ...post.threads.map((thread) => `<li><strong>${escapeHtml(thread.itemId)}</strong>: ${escapeHtml(thread.title || thread.itemId)}${thread.categoryLabel ? ` <span class="blog-thread-category">[${escapeHtml(thread.categoryLabel)}]</span>` : ""}${thread.chatgptUrl ? ` <a class="blog-thread-link" href="${escapeHtml(thread.chatgptUrl)}" target="_blank" rel="noreferrer">ChatGPTで開く</a>` : ""}</li>`),
+        `</ul>`,
+        `</section>`
+      ].join("");
+    }
+    function wrapHtml(bodyHtml) { return `<!doctype html><html lang="ja"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Nikki Diary</title><style>:root{--bg:#f5f0e8;--panel:#fffaf3;--ink:#1f1a17;--accent:#a54b2a;--line:#ddcdbd}body{margin:0;font-family:"Yu Mincho","Hiragino Mincho ProN",serif;color:var(--ink);background:radial-gradient(circle at top left,rgba(165,75,42,.10),transparent 28%),linear-gradient(180deg,#f7efe4 0%,#efe5d6 100%)}main{max-width:900px;margin:0 auto;padding:48px 20px 80px}article{background:var(--panel);border:1px solid var(--line);border-radius:20px;box-shadow:0 16px 40px rgba(53,37,24,.08);padding:40px}h1,h2,h3{line-height:1.3}h1{font-size:2.2rem;border-bottom:2px solid var(--accent);padding-bottom:.4em}h2{margin-top:2.4em;color:var(--accent)}p,li{font-size:1rem;line-height:1.9}ul{padding-left:1.4em}.blog-image-gallery,.blog-thread-list{margin-top:32px;padding-top:20px;border-top:1px solid var(--line)}.blog-image-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}.blog-image-card{margin:0}.blog-image-card img{display:block;width:100%;height:auto;border-radius:14px;border:1px solid var(--line)}.blog-image-card figcaption{margin-top:8px;font-size:.95rem;line-height:1.7}.blog-thread-category{color:var(--accent)}.blog-thread-link{margin-left:.5em}@media print{body{background:#fff}main{padding:0}article{box-shadow:none;border:none;border-radius:0;padding:0}}</style></head><body><main><article>${bodyHtml}</article></main></body></html>`; }
 function emitEvent(runtime, payload) { fs.appendFileSync(runtime.paths.events, `${JSON.stringify({ at: isoJst(), runId: runtime.config.runId, ...payload })}\n`, "utf8"); runtime.current.lastEvent = payload.type || null; runtime.current.note = payload.note || null; }
 function writeProgress(runtime, override = {}) { const started = new Date(runtime.startedAt); writeJson(runtime.paths.progress, { schemaVersion: 1, runId: runtime.config.runId, status: override.status ?? "running", stage: override.stage ?? runtime.current.stage, taskKey: override.taskKey ?? runtime.current.taskKey, itemType: override.itemType ?? runtime.current.itemType, currentItemId: override.currentItemId ?? runtime.current.itemId, currentTaskInstanceId: override.currentTaskInstanceId ?? runtime.current.taskInstanceId, counts: { ...runtime.counts }, startedAt: runtime.startedAt, updatedAt: isoJst(), elapsedSec: Number.isNaN(started.getTime()) ? 0 : Math.max(Math.floor((Date.now() - started.getTime()) / 1000), 0), lastEvent: override.lastEvent ?? runtime.current.lastEvent, promptPreview: override.promptPreview ?? runtime.current.promptPreview, sentAt: override.sentAt ?? runtime.current.sentAt, note: override.note ?? runtime.current.note }); }
 function logConsole(label, target, note = "") { const suffix = note ? ` ${note}` : ""; console.log(`${consoleTime()} [${label}] ${target}${suffix}`); }

@@ -1,28 +1,70 @@
-単位: {{unitId}}
+You are part of a multi-step diary generation pipeline.
 
-表示名: {{unitLabel}}
+Return exactly one valid JSON object.
+Do not output markdown.
+Do not output code fences.
+Do not output explanations.
+Do not output text before or after JSON.
+Use double quotes for all keys and string values.
+All required keys must appear.
+If a field has no information, use [] or "".
+Do not duplicate keys.
+Do not invent facts.
 
-以下の情報から、このまとまり全体の要約を作成してください。
+Task:
+Summarize one grouped set of conversation threads.
 
-この入力は、同じまとまりとして扱う複数の会話スレッドを集約したものです。特定の 1 スレッドだけに引っ張られず、見えている範囲の情報を全体として整理してください。
+This input may contain multiple related threads.
+Your job is to summarize the whole set, not just one thread.
 
-summaryTitle はこのまとまり全体を表す見出しにしてください。単一スレッド専用の狭すぎるタイトルにしないでください。
+Do:
+- integrate all visible threads in the input
+- keep the title broad enough for the whole set
+- merge repeated topics
+- summarize the overall flow
+- emphasize what was worked on or explored in this set
 
-各項目の方針:
-- interests: このまとまり全体で扱われた具体的な関心テーマを統合する
-- questions: このまとまり全体で実際に出た疑問や確認事項を整理する
-- outcomes: 決まったこと、分かったこと、解決したことを整理する
-- images: 入力に含まれる画像情報を整理する
-- narrative: このまとまり全体で何が話され、何が分かり、何が進んだかを短くまとめる
+Do not:
+- focus on only one thread if multiple threads are present
+- invent missing thread content
+- write full diary prose
+- classify categories
+- turn the summary into a general explanation article about the topic itself
 
-注意:
-- 見えていないスレッド内容を推測しない
-- 複数話題がある場合は、1話題だけに寄せすぎない
-- 情報が無い項目は空配列または空文字でよい
-- narrative は 2〜5 文で簡潔にする
+Field meaning:
+- summaryTitle: a Japanese title for the whole set
+- interests: merged concrete interests across the set
+- questions: merged actual questions across the set
+- outcomes: merged conclusions or resolved points across the set
+- images: merged image-related notes
+- narrative: 2 to 5 Japanese sentences describing what was done, examined, or decided across the set
 
-出力は JSON のみ。
+Output schema:
+{
+  "summaryTitle": "...",
+  "interests": ["..."],
+  "questions": ["..."],
+  "outcomes": ["..."],
+  "images": [
+    {
+      "path": "...",
+      "prompt": "...",
+      "note": "..."
+    }
+  ],
+  "narrative": "..."
+}
 
-{"summaryTitle":"見出し","interests":["..."],"questions":["..."],"outcomes":["..."],"images":[{"path":"...","prompt":"...","note":"..."}],"narrative":"2-5文の要約"}
+Strict rules:
+- summarize the whole set, not a single thread
+- if multiple topics exist, do not collapse everything into one narrow title
+- if information is missing, use [] or ""
+- do not invent links between unrelated threads
+- keep narrative concise and factual
+- summaryTitle should describe the record as a whole, not one tiny subtopic
+- narrative should describe the activity across the threads, not lecture about the topic
 
+Group label: {{unitLabel}}
+
+Grouped input:
 {{payloadJson}}

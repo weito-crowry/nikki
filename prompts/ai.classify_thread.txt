@@ -1,35 +1,75 @@
-次の会話スレッドを、与えられたカテゴリ定義の中から分類してください。
+You are part of a multi-step diary generation pipeline.
 
-primary は 1 件だけ選んでください。primary は「このスレッド全体の中心テーマ」を最もよく表すカテゴリです。
+Return exactly one valid JSON object.
+Do not output markdown.
+Do not output code fences.
+Do not output explanations.
+Do not output text before or after JSON.
+Use double quotes for all keys and string values.
+All required keys must appear.
+If a field has no information, use [] or "".
+Do not duplicate keys.
+Do not invent facts.
 
-secondary は最大 2 件までです。secondary は、主テーマとは別に明確な副次テーマがある場合だけ追加してください。無理に埋めないでください。
+Task:
+Classify one conversation thread using a fixed top-level group and a child category under that group.
 
-長いスレッドは複数チャンクの一部である可能性があります。見えている内容だけで保守的に判断してください。確信が弱い場合は、過剰に broad な推測をせず、最も近い既存カテゴリを選んでください。
+Your job is only:
+- choose one primaryGroup from the provided top-level groups
+- choose one primaryCategory from that group's child categories, or define one new child category under that group when necessary
+- choose up to two secondaryCategories only when clearly useful
+- give a short reason
+- propose a new child category only when the correct top-level group exists but no child category fits well
 
-分類ルール:
-- まず既存カテゴリから選ぶ
-- primary は 1 件のみ
-- secondary は本当に必要な場合のみ
-- 同じカテゴリを primary と secondary の両方に入れない
-- タイトルや文書構造ではなく、会話の主題で分類する
-- 出力形式、見出し、質問という行為そのものをカテゴリにしない
+Do:
+- classify by the main topic of the conversation
+- select the top-level group first
+- then select the best child category under that group
+- prefer existing child categories
+- be conservative if the input is only a partial chunk
+- use secondaryCategories only when there is a clearly separate subtopic
 
-新カテゴリ提案ルール:
-- 既存カテゴリのどれでも明らかに不適切な場合のみ proposedCategories を使う
-- proposedCategories は通常は空配列にする
-- 新カテゴリは最小限にする
-- 既存カテゴリの言い換えや細分化だけの提案は禁止
+Do not:
+- summarize the conversation
+- extract findings
+- write diary text
+- create a new top-level group
+- classify by response format such as "article", "list", "explanation", or "plan"
 
-reason は 1〜2 文で簡潔に書いてください。
+Output schema:
+{
+  "primaryGroup": "group-id",
+  "primaryCategory": "category-id",
+  "secondaryCategories": ["category-id"],
+  "reason": "short reason in Japanese",
+  "proposedCategories": [
+    {
+      "groupId": "existing-group-id",
+      "id": "new-category-id",
+      "label": "日本語ラベル",
+      "description": "日本語の説明",
+      "keywords": ["日本語", "日本語"]
+    }
+  ]
+}
 
-出力は JSON のみ。
+Strict rules:
+- primaryGroup must be exactly one existing group id
+- primaryCategory must be exactly one child category id under primaryGroup
+- secondaryCategories must contain 0 to 2 items
+- do not put the same category in primaryCategory and secondaryCategories
+- proposedCategories should usually be []
+- only propose a new child category under an existing group
+- if you propose a new child category, its id may be used as primaryCategory
+- if uncertain, choose the closest existing child category
+- classify by topic, not by document structure or wording style
+- if the thread is mainly about understanding a story, concept, tool, or product, classify that topic directly
 
-{"primary":"category-id","secondary":["category-id"],"reason":"短い理由","proposedCategories":[{"id":"new-category-id","label":"表示名","description":"分類方針","keywords":["語1","語2"]}]}
+Top-level groups:
+{{categoryGroupsJson}}
 
-カテゴリ定義:
+All existing child categories:
+{{flatCategoriesJson}}
 
-{{categoriesJson}}
-
-対象スレッド:
-
+Thread input:
 {{payloadJson}}

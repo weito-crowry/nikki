@@ -1,27 +1,73 @@
-日記エントリID: {{entryId}}
+You are part of a multi-step diary generation pipeline.
 
-対象日付: {{entryDate}}
+Return exactly one valid JSON object.
+Do not output markdown.
+Do not output code fences.
+Do not output explanations.
+Do not output text before or after JSON.
+Use double quotes for all keys and string values.
+All required keys must appear.
+If a field has no information, use [] or "".
+Do not duplicate keys.
+Do not invent facts.
 
-以下の要約情報から、その日の日記本文の草稿を作ってください。
+Task:
+Write a diary draft for one day from structured summaries.
 
-この入力には複数の話題や複数の要約が含まれる場合があります。特定の 1 話題だけに寄せず、その日に扱われた内容全体が伝わるように書いてください。
+Your job is only:
+- create a draft title
+- create a lead
+- create sections
+- create a closing
+- carry image references forward
 
-title はその日全体を表す見出しにしてください。単一話題だけを表す狭すぎるタイトルにしないでください。
+Do:
+- cover the whole day
+- include multiple topics when they exist
+- organize different topics into separate sections
+- keep the text readable and concrete
+- write from the perspective of a daily record of what was explored, asked, checked, or produced
 
-sections の方針:
-- 話題が複数ある場合は section を分けて整理する
-- 各 section は具体的な内容を短くまとめる
-- 入力にある要約を無視しない
+Do not:
+- ignore input summaries
+- collapse everything into one topic if multiple topics exist
+- invent events that are not in the input
+- over-polish the style
+- turn the entry into a neutral encyclopedia article
+- spend most of the text explaining the subject itself instead of recording the day's activity
 
-本文の方針:
-- 事実関係を優先する
-- 入力にない出来事を足さない
-- 誇張しない
-- lead ではその日の全体像を短く示す
-- closing ではその日のまとめや所感を短く示す
+Output schema:
+{
+  "title": "...",
+  "lead": "...",
+  "sections": [
+    {
+      "heading": "...",
+      "body": "..."
+    }
+  ],
+  "closing": "...",
+  "images": [
+    {
+      "path": "...",
+      "caption": "..."
+    }
+  ]
+}
 
-出力は JSON のみ。
+Strict rules:
+- title must represent the whole day, not one narrow topic
+- if multiple topics exist, use multiple sections
+- lead should describe the overall day briefly
+- closing should summarize the day briefly
+- preserve factual accuracy
+- do not add facts that are not in the input
+- each section should say what was handled or learned that day about the topic
+- prefer "今日は〜について確認した / 整理した / 作成した" style over generic explanatory prose
+- if the input is mostly one thread, still write it as a diary record of the activity, not as a standalone article
 
-{"title":"見出し","lead":"導入","sections":[{"heading":"見出し","body":"本文"}],"closing":"締め","images":[{"path":"...","caption":"..."}]}
+Entry id: {{entryId}}
+Entry date: {{entryDate}}
 
+Entry input:
 {{entryJson}}

@@ -1,17 +1,59 @@
-次の日記草稿を、自然な日本語の日記として読みやすく整形してください。
+You are part of a multi-step diary generation pipeline.
 
-この task の目的は整形だけです。内容を作り直すことではありません。
+Return exactly one valid JSON object.
+Do not output markdown outside the JSON string values.
+Do not output code fences.
+Do not output explanations.
+Do not output text before or after JSON.
+Use double quotes for all keys and string values.
+All required keys must appear.
+If a field has no information, use [] or "".
+Do not duplicate keys.
+Do not invent facts.
 
-ルール:
-- 事実は変えない
-- 入力にない情報を追加しない
-- 強い断定や誇張を足さない
-- 見出し構造はできるだけ維持する
-- 画像情報は維持する
-- 冗長さだけを減らし、読みやすさを上げる
+Task:
+Rewrite a diary draft for readability only.
 
-出力は JSON のみ。
+Your job is only:
+- improve clarity
+- reduce redundancy
+- keep the structure readable
 
-{"title":"見出し","markdownBody":"Markdown 本文","images":[{"path":"...","caption":"..."}]}
+Do:
+- preserve the original meaning
+- keep headings if they already exist
+- keep image references
+- keep the text in diary style
 
+Do not:
+- add new facts
+- remove important facts
+- change the scope of the day
+- turn a multi-topic entry into a single-topic entry
+- change the structure more than necessary
+- turn diary prose into an encyclopedia-style article
+- replace activity-oriented sentences with generic topic explanations
+
+Output schema:
+{
+  "title": "...",
+  "markdownBody": "...",
+  "images": [
+    {
+      "path": "...",
+      "caption": "..."
+    }
+  ]
+}
+
+Strict rules:
+- this is a rewrite task, not a generation task
+- preserve facts
+- preserve structure as much as possible
+- preserve images
+- do not add new interpretations
+- keep the text as a record of the day's activity
+- make it clearer, but do not change it into a different genre
+
+Draft input:
 {{draftJson}}

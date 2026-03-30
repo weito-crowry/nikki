@@ -1,48 +1,74 @@
-以下は OpenAI エクスポートから抽出した会話スレッド一覧です。
+You are part of a multi-step diary generation pipeline.
 
-あなたの仕事は、このスレッド一覧を整理するためのカテゴリ一覧を作ることです。
+Return exactly one valid JSON object.
+Do not output markdown.
+Do not output code fences.
+Do not output explanations.
+Do not output text before or after JSON.
+Use double quotes for all keys and string values.
+All required keys must appear.
+If a field has no information, use [] or "".
+Do not duplicate keys.
+Do not invent facts.
 
-後で各スレッドを安定して分類できるように、似た話題をまとめやすいカテゴリを作ってください。
+Task:
+Create a category list for organizing the provided conversation threads.
 
-カテゴリは「会話の主題」で作ってください。出力形式、文書構造、見出し構成、質問という行為そのものをカテゴリにしてはいけません。
+Your job is to create categories that make later thread classification stable and easy.
+Create categories based on recurring conversation topics, not on writing format, task structure, or generic intent.
 
-カテゴリ数は最大 {{maxCategories}} 個ですが、必要最小限にしてください。まず 4〜8 個を目安にし、本当に必要な場合だけ増やしてください。
+Do:
+- create topic-based categories
+- use medium-grain categories
+- merge similar themes
+- keep the number of categories minimal
+- prefer categories that can apply to multiple similar threads
 
-カテゴリの粒度は中粒度にしてください。
-- 広すぎるカテゴリは禁止
-- 個別案件専用カテゴリも禁止
-- 似た内容は統合してください
-- 1件しか支えられないカテゴリを乱立させないでください
+Do not:
+- create categories from document structure
+- create categories for generic actions such as asking questions
+- create very broad generic labels
+- create categories for topics not supported by the input
+- create many near-duplicate categories
+- create categories for one single prompt wording if a broader topic category is possible
 
-次のような汎用カテゴリは禁止です。
-- その他
-- 日常
-- 質問
-- 学び
-- ニュース
-- ライフスタイル
-- 技術
+Bad category examples:
+- Other
+- Daily life
+- Question
+- Learning
+- Technology
+- News
+- Explanation
+- Conversation
+- Article structure
 
-入力サンプルに現れていない話題を推測でカテゴリ化してはいけません。
+Category rules:
+- id: lowercase letters and hyphens only
+- label: short Japanese noun phrase
+- description: one Japanese sentence describing what belongs in the category
+- keywords: array of 2 to 4 Japanese strings
 
-カテゴリ設計ルール:
-- id は英小文字とハイフンのみ
-- label は日本語の短い名詞句
-- description は「どのような thread を入れるカテゴリか」を 1 文で書く
-- keywords は 2〜4 個の文字列配列
-- categories は重複禁止
-- 同義語に近いカテゴリを複数作らない
+Output schema:
+{
+  "categories": [
+    {
+      "id": "short-id",
+      "label": "表示名",
+      "description": "分類方針",
+      "keywords": ["語1", "語2"]
+    }
+  ]
+}
 
-良い例:
-- SEO 記事作成の相談が多い -> `web-marketing`, `content-writing`, `sports-supplements`
+Strict rules:
+- create only categories supported by the input
+- prefer 4 to 8 categories unless more are clearly needed
+- avoid one-off categories tied to a single narrow case
+- avoid duplicate or near-duplicate categories
+- create at most {{maxCategories}} categories
+- prefer topic labels such as "WEBマーケティング" or "童話・物語考察"
+- avoid labels such as "質問", "記事構成", "説明", "会話"
 
-悪い例:
-- `質問`, `見出し`, `記事タイトル`, `その他`
-
-出力は JSON のみ。
-
-{"categories":[{"id":"short-id","label":"表示名","description":"分類方針","keywords":["語1","語2"]}]}
-
-スレッド一覧:
-
+Thread list:
 {{sampleJson}}

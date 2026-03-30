@@ -9,8 +9,9 @@ import { TASK_DEFINITIONS } from "./task-definitions.js";
 
 const execFileAsync = promisify(execFile);
 let appServerClientPromise = null;
-let activeDeltaConsoleKey = null;
-let activeDeltaConsoleTrailingNewline = true;
+let activeStreamConsoleKey = null;
+let activeStreamConsoleLabel = null;
+let activeStreamConsoleTrailingNewline = true;
 const promptTemplateCache = new Map();
 
 export async function inspectZip(zipPath) {
@@ -461,7 +462,8 @@ async function collectAdaptiveThreadResults(runtime, options, groups, depth, pat
 
 function buildClassifyThreadPrompt(categories, payload) {
   return renderPromptTemplate("ai.classify_thread", {
-    categoriesJson: JSON.stringify(categories.categories || [], null, 2),
+    categoryGroupsJson: JSON.stringify(categories.groups || [], null, 2),
+    flatCategoriesJson: JSON.stringify(categories.categories || [], null, 2),
     payloadJson: JSON.stringify(payload, null, 2)
   });
 }
@@ -473,14 +475,17 @@ function buildExtractFindingsPrompt(payload) {
 }
 
 function mergeClassificationResults(items) {
-  const primaryCounts = new Map();
+  const primaryGroupCounts = new Map();
+  const primaryCategoryCounts = new Map();
   const secondaryCounts = new Map();
   const reasons = [];
   const proposedCategories = [];
   for (const item of items) {
-    const primary = item?.primary || "uncategorized";
-    primaryCounts.set(primary, (primaryCounts.get(primary) || 0) + 1);
-    for (const secondary of Array.isArray(item?.secondary) ? item.secondary : []) {
+    const primaryGroup = item?.primaryGroup || "other";
+    const primaryCategory = item?.primaryCategory || item?.primary || "uncategorized";
+    primaryGroupCounts.set(primaryGroup, (primaryGroupCounts.get(primaryGroup) || 0) + 1);
+    primaryCategoryCounts.set(primaryCategory, (primaryCategoryCounts.get(primaryCategory) || 0) + 1);
+    for (const secondary of Array.isArray(item?.secondaryCategories) ? item.secondaryCategories : Array.isArray(item?.secondary) ? item.secondary : []) {
       secondaryCounts.set(secondary, (secondaryCounts.get(secondary) || 0) + 1);
     }
     if (item?.reason) {
@@ -490,9 +495,18 @@ function mergeClassificationResults(items) {
       proposedCategories.push(...item.proposedCategories);
     }
   }
-  const primary = [...primaryCounts.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] || "uncategorized";
-  const secondary = [...secondaryCounts.entries()].filter(([value]) => value && value !== primary).sort((left, right) => right[1] - left[1]).slice(0, 2).map(([value]) => value);
-  return { primary, secondary, reason: reasons[0] || "", proposedCategories: normalizeProposedCategories(proposedCategories) };
+  const primaryGroup = [...primaryGroupCounts.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] || "other";
+  const primaryCategory = [...primaryCategoryCounts.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] || "uncategorized";
+  const secondaryCategories = [...secondaryCounts.entries()].filter(([value]) => value && value !== primaryCategory).sort((left, right) => right[1] - left[1]).slice(0, 2).map(([value]) => value);
+  return {
+    primaryGroup,
+    primaryCategory,
+    primary: primaryCategory,
+    secondaryCategories,
+    secondary: secondaryCategories,
+    reason: reasons[0] || "",
+    proposedCategories: normalizeProposedCategories(proposedCategories)
+  };
 }
 
 function mergeFindingsResults(items) {
@@ -662,12 +676,14 @@ function threadSplitPlanPath(runtime, taskKey, itemId) {
 }
 
 function readCategoryMaster(runtime) {
-  return readArtifact(runtime, "artifacts/ai/category_master.json") || readArtifact(runtime, "artifacts/ai/categories.json") || null;
+  const value = readArtifact(runtime, "artifacts/ai/category_master.json") || readArtifact(runtime, "artifacts/ai/categories.json") || null;
+  return value ? normalizeCategoryMaster(runtime, value) : null;
 }
 
 function writeCategoryMaster(runtime, value) {
-  writeArtifact(runtime, "artifacts/ai/category_master.json", value);
-  writeArtifact(runtime, "artifacts/ai/categories.json", value);
+  const normalized = normalizeCategoryMaster(runtime, value);
+  writeArtifact(runtime, "artifacts/ai/category_master.json", normalized);
+  writeArtifact(runtime, "artifacts/ai/categories.json", normalized);
 }
 
 function readCategorySuggestions(runtime) {
@@ -678,6 +694,94 @@ function writeCategorySuggestions(runtime, value) {
   writeArtifact(runtime, "artifacts/ai/category_suggestions.json", value);
 }
 
+function defaultCategoryGroups() {
+  return [
+    { id: "work", label: "仕事", description: "仕事として進めた依頼、業務、調査、制作に関するまとまり。", keywords: ["仕事", "業務", "依頼"] },
+    { id: "technology", label: "技術", description: "プログラミング、ツール、AI、システム利用に関するまとまり。", keywords: ["技術", "開発", "AI"] },
+    { id: "research-learning", label: "調査・学習", description: "概念の理解、比較、調査、知識整理に関するまとまり。", keywords: ["調査", "学習", "理解"] },
+    { id: "creative-media", label: "創作・メディア", description: "物語、作品、文章、表現の検討に関するまとまり。", keywords: ["創作", "作品", "文章"] },
+    { id: "life", label: "生活", description: "日常生活、健康、買い物、趣味に関するまとまり。", keywords: ["生活", "健康", "趣味"] },
+    { id: "other", label: "その他", description: "上記の大カテゴリに明確に収まらないまとまり。", keywords: ["その他"] }
+  ];
+}
+
+function normalizeCategoryGroups(groups) {
+  const input = Array.isArray(groups) && groups.length ? groups : defaultCategoryGroups();
+  const seen = new Set();
+  const result = [];
+  for (const item of input) {
+    if (!item || typeof item !== "object") continue;
+    const id = sanitizeId(String(item.id || item.label || "").trim()).toLowerCase();
+    const label = String(item.label || "").trim();
+    if (!id || !label || seen.has(id)) continue;
+    seen.add(id);
+    result.push({
+      id,
+      label,
+      description: String(item.description || "").trim() || `${label} に関する大カテゴリ。`,
+      keywords: uniqueStrings(Array.isArray(item.keywords) ? item.keywords : []).slice(0, 6)
+    });
+  }
+  return result.length ? result : defaultCategoryGroups();
+}
+
+function normalizeCategoryMaster(runtime, value) {
+  const configuredGroups = normalizeCategoryGroups(runtime.config.categoryGroups);
+  const existingGroups = Array.isArray(value?.groups) ? value.groups : [];
+  const legacyCategories = Array.isArray(value?.categories) ? value.categories : [];
+  const mergedGroups = configuredGroups.map((configured) => {
+    const matched = existingGroups.find((group) => sanitizeId(String(group?.id || "")).toLowerCase() === configured.id);
+    const categories = Array.isArray(matched?.categories)
+      ? matched.categories
+      : configured.id === "other"
+        ? legacyCategories
+        : [];
+    return {
+      id: configured.id,
+      label: configured.label,
+      description: configured.description,
+      keywords: configured.keywords,
+      categories: normalizeChildCategories(categories, configured)
+    };
+  });
+  const flatCategories = mergedGroups.flatMap((group) => group.categories.map((category) => ({
+    id: category.id,
+    label: category.label,
+    description: category.description,
+    keywords: category.keywords,
+    groupId: group.id,
+    groupLabel: group.label
+  })));
+  return {
+    schemaVersion: 2,
+    generatedAt: value?.generatedAt || isoJst(),
+    runId: value?.runId || runtime.config.runId,
+    groups: mergedGroups,
+    categories: flatCategories,
+    aiMeta: value?.aiMeta || null,
+    updatedBy: value?.updatedBy || null
+  };
+}
+
+function normalizeChildCategories(categories, group) {
+  const seen = new Set();
+  const result = [];
+  for (const item of categories || []) {
+    if (!item || typeof item !== "object") continue;
+    const label = String(item.label || "").trim();
+    const id = sanitizeId(String(item.id || label).trim()).toLowerCase();
+    if (!id || !label || seen.has(id)) continue;
+    seen.add(id);
+    result.push({
+      id,
+      label,
+      description: String(item.description || "").trim() || `${group.label} 配下の ${label} に関するカテゴリ。`,
+      keywords: uniqueStrings(Array.isArray(item.keywords) ? item.keywords : []).slice(0, 6)
+    });
+  }
+  return result;
+}
+
 function normalizeProposedCategories(items) {
   const result = [];
   const seen = new Set();
@@ -686,9 +790,11 @@ function normalizeProposedCategories(items) {
     const label = String(item.label || "").trim();
     const rawId = String(item.id || label).trim();
     const id = sanitizeId(rawId).toLowerCase();
-    if (!id || !label || seen.has(id)) continue;
-    seen.add(id);
+    const groupId = sanitizeId(String(item.groupId || item.primaryGroup || "").trim()).toLowerCase();
+    if (!id || !label || !groupId || seen.has(`${groupId}:${id}`)) continue;
+    seen.add(`${groupId}:${id}`);
     result.push({
+      groupId,
       id,
       label,
       description: String(item.description || "").trim() || `${label} に関する話題を分類するカテゴリ。`,
@@ -703,10 +809,14 @@ function mergeCategoryMaster(runtime, proposedCategories, itemId = null) {
   if (!normalized.length) {
     return false;
   }
+  if (runtime.config.freezeCategories) {
+    return false;
+  }
   const currentSuggestions = readCategorySuggestions(runtime);
   const suggestionItems = Array.isArray(currentSuggestions.items) ? currentSuggestions.items : [];
   for (const category of normalized) {
     suggestionItems.push({
+      groupId: category.groupId,
       id: category.id,
       label: category.label,
       description: category.description,
@@ -722,16 +832,23 @@ function mergeCategoryMaster(runtime, proposedCategories, itemId = null) {
     runId: runtime.config.runId,
     items: suggestionItems
   });
-  const current = readCategoryMaster(runtime) || { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, categories: [], aiMeta: null };
-  const existing = Array.isArray(current.categories) ? current.categories : [];
-  const byId = new Map(existing.map((category) => [category.id, category]));
+  const current = readCategoryMaster(runtime) || normalizeCategoryMaster(runtime, { schemaVersion: 2, generatedAt: isoJst(), runId: runtime.config.runId, groups: [] });
+  const groups = Array.isArray(current.groups) ? current.groups.map((group) => ({ ...group, categories: [...(group.categories || [])] })) : [];
   let changed = false;
   for (const category of normalized) {
-    if (byId.has(category.id)) {
+    const group = groups.find((entry) => entry.id === category.groupId);
+    if (!group) {
       continue;
     }
-    existing.push(category);
-    byId.set(category.id, category);
+    if (group.categories.some((entry) => entry.id === category.id || entry.label === category.label)) {
+      continue;
+    }
+    group.categories.push({
+      id: category.id,
+      label: category.label,
+      description: category.description,
+      keywords: category.keywords
+    });
     changed = true;
   }
   if (!changed) {
@@ -739,14 +856,14 @@ function mergeCategoryMaster(runtime, proposedCategories, itemId = null) {
   }
   writeCategoryMaster(runtime, {
     ...current,
-    schemaVersion: 1,
+    schemaVersion: 2,
     generatedAt: isoJst(),
     runId: runtime.config.runId,
-    categories: existing,
+    groups,
     updatedBy: itemId ? { taskKey: "ai.classify_thread", itemId, at: isoJst() } : current.updatedBy || null
   });
   if (itemId) {
-    const note = `新カテゴリを category master に追加しました (${normalized.map((category) => category.id).join(", ")})`;
+    const note = `新しい中カテゴリを category master に追加しました (${normalized.map((category) => `${category.groupId}/${category.id}`).join(", ")})`;
     emitEvent(runtime, { type: "category_master.updated", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, itemId, taskInstanceId: runtime.current.taskInstanceId, note });
     logConsole("cat  ", `${runtime.current.taskKey}__${itemId}`, note);
   }
@@ -975,7 +1092,7 @@ function migrateReusableState(runtime, definition, item, state, meta, dependsOn)
     }
     const classificationArtifact = readArtifact(runtime, `artifacts/ai/thread_classification/${item.itemId}.json`);
     const categoryIds = new Set((readCategoryMaster(runtime)?.categories || []).map((category) => category.id));
-    const usedCategoryIds = [classificationArtifact?.primary, ...(classificationArtifact?.secondary || [])].filter(Boolean);
+      const usedCategoryIds = [classificationArtifact?.primaryCategory || classificationArtifact?.primary, ...((classificationArtifact?.secondaryCategories || classificationArtifact?.secondary || []))].filter(Boolean);
     const canCompatMigrate = classificationArtifact
       && state.model === meta.model
       && usedCategoryIds.length > 0
@@ -1191,17 +1308,20 @@ function handleAttachImages(runtime) {
 }
 
 async function handleCategories(runtime, meta) {
-  if (runtime.config.freezeCategories) {
-    const artifact = readCategoryMaster(runtime);
-    if (!artifact) {
-      throw new Error("freezeCategories=true ですが artifacts/ai/category_master.json が存在しません。");
+  const current = readCategoryMaster(runtime);
+  const next = normalizeCategoryMaster(runtime, current || { schemaVersion: 2, generatedAt: isoJst(), runId: runtime.config.runId, groups: [] });
+  writeCategoryMaster(runtime, {
+    ...next,
+    aiMeta: {
+      model: meta.model,
+      think: meta.think,
+      promptHash: meta.promptHash,
+      inputHash: meta.inputHash,
+      provider: aiProviderLabel(runtime),
+      cacheHit: Boolean(current)
     }
-    return ["artifacts/ai/category_master.json", "artifacts/ai/categories.json"];
-  }
-  const response = await askForJson(runtime, "ai.generate_category_candidates", "run", "categories", meta);
-  writeCategoryMaster(runtime, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, categories: Array.isArray(response.parsed.categories) ? response.parsed.categories : [], aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit } });
-  writeRaw(runtime, "ai.generate_category_candidates", "run", response.text);
-  return ["artifacts/ai/category_master.json", "artifacts/ai/categories.json", "artifacts/raw/ai.generate_category_candidates/run.raw.json"];
+  });
+  return ["artifacts/ai/category_master.json", "artifacts/ai/categories.json"];
 }
 
 async function handleClassifyThread(runtime, itemId, meta) {
@@ -1213,7 +1333,32 @@ async function handleClassifyThread(runtime, itemId, meta) {
   if (masterUpdated) {
     artifactPaths.push("artifacts/ai/category_master.json", "artifacts/ai/categories.json");
   }
-  writeArtifact(runtime, `artifacts/ai/thread_classification/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, primary: response.parsed.primary || "uncategorized", secondary: Array.isArray(response.parsed.secondary) ? response.parsed.secondary : [], reason: response.parsed.reason || "", proposedCategories: Array.isArray(response.parsed.proposedCategories) ? response.parsed.proposedCategories : [], aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit, adaptiveSplit: response.adaptiveSplit, chunkCount: response.chunkCount, categoryMasterUpdated: masterUpdated } });
+  const primaryGroup = response.parsed.primaryGroup || "other";
+  const primaryCategory = response.parsed.primaryCategory || response.parsed.primary || "uncategorized";
+  const secondaryCategories = Array.isArray(response.parsed.secondaryCategories)
+    ? response.parsed.secondaryCategories
+    : Array.isArray(response.parsed.secondary)
+      ? response.parsed.secondary
+      : [];
+  const categoryLabels = new Map((categories.categories || []).map((category) => [category.id, category.label]));
+  const groupLabels = new Map((categories.groups || []).map((group) => [group.id, group.label]));
+  writeArtifact(runtime, `artifacts/ai/thread_classification/${itemId}.json`, {
+    schemaVersion: 2,
+    generatedAt: isoJst(),
+    runId: runtime.config.runId,
+    itemId,
+    primaryGroup,
+    primaryGroupLabel: groupLabels.get(primaryGroup) || primaryGroup,
+    primaryCategory,
+    primaryCategoryLabel: categoryLabels.get(primaryCategory) || primaryCategory,
+    secondaryCategories,
+    secondaryCategoryLabels: secondaryCategories.map((categoryId) => categoryLabels.get(categoryId) || categoryId),
+    primary: primaryCategory,
+    secondary: secondaryCategories,
+    reason: response.parsed.reason || "",
+    proposedCategories: Array.isArray(response.parsed.proposedCategories) ? response.parsed.proposedCategories : [],
+    aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit, adaptiveSplit: response.adaptiveSplit, chunkCount: response.chunkCount, categoryMasterUpdated: masterUpdated }
+  });
   writeRaw(runtime, "ai.classify_thread", itemId, response.text);
   return artifactPaths;
 }
@@ -1252,7 +1397,7 @@ function handleGroupUnits(runtime) {
       continue;
     }
     const classification = classes.get(thread.itemId);
-    const category = runtime.config.grouping === "category" ? (classification?.primary || "uncategorized") : null;
+    const category = runtime.config.grouping === "category" ? (classification?.primaryCategory || classification?.primary || "uncategorized") : null;
     const itemId = runtime.config.grouping === "category" ? `unit_category_${category}` : `unit_date_${date}`;
     if (!buckets.has(itemId)) buckets.set(itemId, { itemId, label: runtime.config.grouping === "category" ? (labels.get(category) || category) : `${date} の記録`, date, category, entryId: `entry_${date}`, threadItemIds: [] });
     if (!buckets.get(itemId).threadItemIds.includes(thread.itemId)) {
@@ -1746,7 +1891,7 @@ function buildRenderIndexMarkdown(posts) {
   const seen = new Set();
   for (const threadItemId of threadItemIds || []) {
     const classification = readArtifact(runtime, `artifacts/ai/thread_classification/${threadItemId}.json`);
-    const ids = [classification?.primary, ...(classification?.secondary || [])].filter(Boolean);
+    const ids = [classification?.primaryCategory || classification?.primary, ...((classification?.secondaryCategories || classification?.secondary || []))].filter(Boolean);
     for (const id of ids) {
       if (seen.has(id)) continue;
       seen.add(id);
@@ -1759,7 +1904,7 @@ function buildRenderIndexMarkdown(posts) {
       return (threadItemIds || []).map((threadItemId) => {
         const thread = readArtifact(runtime, `artifacts/normalized/${threadItemId}.json`) || {};
         const classification = readArtifact(runtime, `artifacts/ai/thread_classification/${threadItemId}.json`) || {};
-        const categoryId = classification.primary || null;
+        const categoryId = classification.primaryCategory || classification.primary || null;
         return {
           itemId: threadItemId,
           title: thread.title || thread.preview || threadItemId,
@@ -1924,48 +2069,51 @@ function wrapBlogPostHtml(post, entry, posts) {
     function wrapHtml(bodyHtml) { return `<!doctype html><html lang="ja"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Nikki Diary</title><style>:root{--bg:#f5f0e8;--panel:#fffaf3;--ink:#1f1a17;--accent:#a54b2a;--line:#ddcdbd}body{margin:0;font-family:"Yu Mincho","Hiragino Mincho ProN",serif;color:var(--ink);background:radial-gradient(circle at top left,rgba(165,75,42,.10),transparent 28%),linear-gradient(180deg,#f7efe4 0%,#efe5d6 100%)}main{max-width:900px;margin:0 auto;padding:48px 20px 80px}article{background:var(--panel);border:1px solid var(--line);border-radius:20px;box-shadow:0 16px 40px rgba(53,37,24,.08);padding:40px}h1,h2,h3{line-height:1.3}h1{font-size:2.2rem;border-bottom:2px solid var(--accent);padding-bottom:.4em}h2{margin-top:2.4em;color:var(--accent)}p,li{font-size:1rem;line-height:1.9}ul{padding-left:1.4em}.blog-image-gallery,.blog-thread-list{margin-top:32px;padding-top:20px;border-top:1px solid var(--line)}.blog-image-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}.blog-image-card{margin:0}.blog-image-card img{display:block;width:100%;height:auto;border-radius:14px;border:1px solid var(--line)}.blog-image-card figcaption{margin-top:8px;font-size:.95rem;line-height:1.7}.blog-thread-category{color:var(--accent)}.blog-thread-link{margin-left:.5em}@media print{body{background:#fff}main{padding:0}article{box-shadow:none;border:none;border-radius:0;padding:0}}</style></head><body><main><article>${bodyHtml}</article></main></body></html>`; }
 function emitEvent(runtime, payload) { fs.appendFileSync(runtime.paths.events, `${JSON.stringify({ at: isoJst(), runId: runtime.config.runId, ...payload })}\n`, "utf8"); runtime.current.lastEvent = payload.type || null; runtime.current.note = payload.note || null; }
 function writeProgress(runtime, override = {}) { const started = new Date(runtime.startedAt); writeJson(runtime.paths.progress, { schemaVersion: 1, runId: runtime.config.runId, status: override.status ?? "running", stage: override.stage ?? runtime.current.stage, taskKey: override.taskKey ?? runtime.current.taskKey, itemType: override.itemType ?? runtime.current.itemType, currentItemId: override.currentItemId ?? runtime.current.itemId, currentTaskInstanceId: override.currentTaskInstanceId ?? runtime.current.taskInstanceId, counts: { ...runtime.counts }, startedAt: runtime.startedAt, updatedAt: isoJst(), elapsedSec: Number.isNaN(started.getTime()) ? 0 : Math.max(Math.floor((Date.now() - started.getTime()) / 1000), 0), lastEvent: override.lastEvent ?? runtime.current.lastEvent, promptPreview: override.promptPreview ?? runtime.current.promptPreview, sentAt: override.sentAt ?? runtime.current.sentAt, note: override.note ?? runtime.current.note }); }
-function logConsole(label, target, note = "") { ensureDeltaConsoleClosed(); const suffix = note ? ` ${note}` : ""; console.log(`${consoleTime()} [${label}] ${target}${suffix}`); }
+function logConsole(label, target, note = "") { ensureStreamConsoleClosed(); const suffix = note ? ` ${note}` : ""; console.log(`${consoleTime()} [${label}] ${target}${suffix}`); }
 function logTextBlock(label, target, text) {
-  ensureDeltaConsoleClosed();
+  ensureStreamConsoleClosed();
   console.log(`${consoleTime()} [${label}] ${target}`);
   console.log(String(text ?? "").trim());
 }
 function logThinkingConsole(taskKey, itemId, thinkingText) {
-  ensureDeltaConsoleClosed();
-  console.log(`${consoleTime()} [think] ${taskKey}__${itemId}`);
-  console.log(String(thinkingText).trim());
+  logStreamConsole("think", taskKey, itemId, thinkingText);
 }
 function logResponseDeltaConsole(taskKey, itemId, text) {
+  logStreamConsole("delta", taskKey, itemId, text);
+}
+function logStreamConsole(label, taskKey, itemId, text) {
   const key = `${taskKey}__${itemId}`;
   const chunk = String(text ?? "");
   if (!chunk) {
     return;
   }
-  if (activeDeltaConsoleKey !== key) {
-    ensureDeltaConsoleClosed();
-    activeDeltaConsoleKey = key;
-    activeDeltaConsoleTrailingNewline = true;
-    console.log(`${consoleTime()} [delta] ${key}`);
+  if (activeStreamConsoleKey !== key || activeStreamConsoleLabel !== label) {
+    ensureStreamConsoleClosed();
+    activeStreamConsoleKey = key;
+    activeStreamConsoleLabel = label;
+    activeStreamConsoleTrailingNewline = true;
+    console.log(`${consoleTime()} [${label}] ${key}`);
   }
   process.stdout.write(chunk);
-  activeDeltaConsoleTrailingNewline = /[\r\n]$/.test(chunk);
+  activeStreamConsoleTrailingNewline = /[\r\n]$/.test(chunk);
 }
 function flushResponseDeltaConsole(taskKey, itemId) {
   const key = `${taskKey}__${itemId}`;
-  if (activeDeltaConsoleKey !== key) {
+  if (activeStreamConsoleKey !== key) {
     return;
   }
-  ensureDeltaConsoleClosed();
+  ensureStreamConsoleClosed();
 }
-function ensureDeltaConsoleClosed() {
-  if (!activeDeltaConsoleKey) {
+function ensureStreamConsoleClosed() {
+  if (!activeStreamConsoleKey) {
     return;
   }
-  if (!activeDeltaConsoleTrailingNewline) {
+  if (!activeStreamConsoleTrailingNewline) {
     process.stdout.write("\n");
   }
-  activeDeltaConsoleKey = null;
-  activeDeltaConsoleTrailingNewline = true;
+  activeStreamConsoleKey = null;
+  activeStreamConsoleLabel = null;
+  activeStreamConsoleTrailingNewline = true;
 }
 function taskInstanceId(taskKey, itemId) { return `${taskKey}__${itemId}`; }
 function aiCacheKey(taskKey, meta) { return crypto.createHash("sha256").update(JSON.stringify({ taskKey, model: meta.model, think: meta.think ?? null, inputHash: meta.inputHash, promptHash: meta.promptHash, taskVersion: 1, outputSchemaVersion: 1 })).digest("hex"); }

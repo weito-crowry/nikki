@@ -1,24 +1,75 @@
-次の会話スレッドから、あとで日記を書くために必要な情報を抜き出してください。
+You are part of a multi-step diary generation pipeline.
 
-長いスレッドは複数チャンクの一部である可能性があります。見えている内容だけから抽出してください。推測で補わないでください。
+Return exactly one valid JSON object.
+Do not output markdown.
+Do not output code fences.
+Do not output explanations.
+Do not output text before or after JSON.
+Use double quotes for all keys and string values.
+All required keys must appear.
+If a field has no information, use [] or "".
+Do not duplicate keys.
+Do not invent facts.
 
-特に次の 5 種類を整理してください。
-- interests: このスレッドで扱っている具体的な関心テーマ
-- questions: ユーザーが実際に知りたがっていたこと、確認したかったこと
-- outcomes: 会話の中で決まったこと、分かったこと、解決したこと
-- images: 画像生成や画像参照がある場合の情報
-- narrative: スレッド全体で何をして何がどうなったかの短い流れ
+Task:
+Extract factual diary material from one conversation thread.
 
-抽出ルール:
-- interests は具体的な話題にする
-- questions は会話に明示されたものだけにする
-- outcomes は明確な結論や決定がある場合だけ入れる
-- images は実際にスレッド内で参照された画像や生成画像だけにする
-- 情報が無い項目は空配列または空文字にする
-- 誇張や要約しすぎを避ける
+Your job is only:
+- extract interests
+- extract questions
+- extract outcomes
+- extract image-related notes
+- write a short factual narrative
 
-出力は JSON のみ。
+Do:
+- use only information explicitly present in the input
+- extract concrete topics
+- keep narrative short and factual
+- focus on what the user asked, examined, confirmed, decided, or produced in this thread
 
-{"interests":["..."],"questions":[{"text":"...","status":"resolved|partially_resolved|unresolved"}],"outcomes":["..."],"images":[{"path":"...","note":"..."}],"narrative":"2-5文の要約"}
+Do not:
+- classify the thread
+- write diary prose
+- invent missing outcomes
+- infer emotions or intentions unless clearly stated
+- turn the topic itself into a mini article or background explanation
+- restate the assistant's long explanation as if it were a diary outcome unless the thread clearly reached that result
 
+Field meaning:
+- interests: concrete topics discussed in the thread
+- questions: things the user actually asked or wanted to confirm
+- outcomes: decisions, conclusions, completed deliverables, or resolved points that are clearly supported by the thread
+- images: actual image references or generated images mentioned in the thread
+- narrative: 2 to 5 Japanese sentences describing what the user worked on in this thread and what happened
+
+Output schema:
+{
+  "interests": ["..."],
+  "questions": [
+    {
+      "text": "...",
+      "status": "resolved|partially_resolved|unresolved"
+    }
+  ],
+  "outcomes": ["..."],
+  "images": [
+    {
+      "path": "...",
+      "note": "..."
+    }
+  ],
+  "narrative": "..."
+}
+
+Strict rules:
+- if there is no information, use [] or ""
+- questions must be explicitly asked in the thread
+- outcomes must be explicitly supported by the thread
+- do not repeat the same item with different wording
+- do not output classification labels
+- interests should be concise topic phrases, not full explanations
+- outcomes should prefer concrete results such as "X was decided", "Y was explained", "Z draft was produced"
+- narrative should describe the activity in the thread, not explain the subject matter in general
+
+Thread input:
 {{payloadJson}}

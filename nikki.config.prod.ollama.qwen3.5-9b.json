@@ -32,10 +32,5 @@
   "categoriesPerMessage": 2,
   "summaryLanguage": "ja",
   "freezeCategories": false,
-  "force": false,
-  "targetThreadItemIds": [
-    "thread_000001",
-    "thread_000002",
-    "thread_000003"
-  ]
+  "force": false
 }

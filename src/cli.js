@@ -43,6 +43,7 @@ function resolveConfig(options, positionals = []) {
     model: options.model ?? fileConfig.model ?? "gpt-5.4",
     taskModels: normalizeTaskModels(fileConfig.taskModels),
     taskThinks: normalizeTaskThinks(fileConfig.taskThinks),
+    categoryGroups: normalizeCategoryGroups(fileConfig.categoryGroups),
     maxCategories: Number(options["max-categories"] ?? fileConfig.maxCategories ?? 12),
     categoriesPerMessage: Number(options["categories-per-message"] ?? fileConfig.categoriesPerMessage ?? 2),
     summaryLanguage: options.language ?? fileConfig.summaryLanguage ?? "ja",
@@ -116,6 +117,21 @@ function normalizeTaskThinks(value) {
       .filter(([key, think]) => key && typeof normalizeBooleanValue(think) === "boolean")
       .map(([key, think]) => [String(key), normalizeBooleanValue(think)])
   );
+}
+
+function normalizeCategoryGroups(value) {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  return value
+    .filter((item) => item && typeof item === "object")
+    .map((item) => ({
+      id: String(item.id || "").trim(),
+      label: String(item.label || "").trim(),
+      description: String(item.description || "").trim(),
+      keywords: Array.isArray(item.keywords) ? item.keywords.map((entry) => String(entry).trim()).filter(Boolean) : []
+    }))
+    .filter((item) => item.id && item.label);
 }
 
 function normalizeBooleanValue(value) {

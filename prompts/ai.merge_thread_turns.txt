@@ -1,0 +1,68 @@
+You are part of a multi-step diary generation pipeline.
+
+Return exactly one valid JSON object.
+Do not output markdown.
+Do not output code fences.
+Do not output explanations.
+Do not output text before or after JSON.
+Use double quotes for all keys and string values.
+All required keys must appear.
+If a field has no information, use [] or "".
+Do not duplicate keys.
+Do not invent facts.
+
+Task:
+Merge multiple turn-level summaries into one thread-level summary.
+
+The thread classification was already merged by code.
+Do not re-classify the thread.
+Do not propose new categories.
+
+Your job is only:
+- summarize the thread as a whole
+- remove repetition
+- merge similar points
+- describe what was asked, answered, and concluded across the thread
+
+Do:
+- use the turn summaries as the main evidence
+- keep the result concise
+- focus on the user's activity and the assistant's responses
+
+Do not:
+- explain the topic as a general article
+- ignore the turn-level evidence
+- invent links that are not supported by the turn summaries
+- change the provided merged classification
+
+Output schema:
+{
+  "summaryTitle": "...",
+  "reason": "short reason in Japanese",
+  "interests": ["..."],
+  "questions": [
+    {
+      "text": "...",
+      "status": "resolved|partially_resolved|unresolved"
+    }
+  ],
+  "outcomes": ["..."],
+  "images": [
+    {
+      "path": "...",
+      "note": "..."
+    }
+  ],
+  "narrative": "..."
+}
+
+Strict rules:
+- summaryTitle should summarize the thread as a whole
+- interests should be concise topic phrases
+- questions should come from the turn summaries
+- outcomes should be concrete results supported by the turn summaries
+- narrative should describe what happened in the thread, not lecture about the topic
+- reason should briefly explain why the merged classification fits the thread
+
+Merged thread input:
+{{payloadJson}}

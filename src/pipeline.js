@@ -112,16 +112,18 @@ function initRun(runtime) {
   for (const relative of [
     "work/extracted",
     "artifacts/manifest",
-    "artifacts/indexes",
-    "artifacts/normalized",
-    "artifacts/ai/thread_classification",
-    "artifacts/ai/thread_findings",
-    "artifacts/ai/unit_summaries",
+      "artifacts/indexes",
+      "artifacts/normalized",
+      "artifacts/turns",
+      "artifacts/ai/turn_summaries",
+      "artifacts/ai/turn_classification",
+      "artifacts/ai/thread_summaries",
+      "artifacts/ai/thread_classification",
+      "artifacts/ai/thread_findings",
+      "artifacts/ai/unit_summaries",
     "artifacts/ai/diary_drafts",
     "artifacts/ai/diary_entries",
-    "artifacts/chunks/ai.classify_thread",
-    "artifacts/chunks/ai.extract_findings",
-    "artifacts/raw",
+      "artifacts/raw",
     "artifacts/units",
     "artifacts/render",
     "task-state",
@@ -204,6 +206,9 @@ function enumerateItems(runtime, itemType) {
   }
   if (itemType === "thread") {
     return (readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || []).map((meta) => ({ itemId: meta.itemId, meta }));
+  }
+  if (itemType === "turn") {
+    return (readArtifact(runtime, "artifacts/indexes/turn-index.json")?.turns || []).map((meta) => ({ itemId: meta.itemId, meta }));
   }
   if (itemType === "unit") {
     return (readArtifact(runtime, "artifacts/units/units.json")?.items || []).map((meta) => ({ itemId: meta.itemId, meta }));
@@ -304,44 +309,62 @@ async function buildTaskMeta(runtime, definition, item) {
       return { inputHash: hashJson(readArtifact(runtime, "artifacts/manifest/export-manifest.json") || {}), promptHash: null, model: null, promptPreview: null };
     case "analyze.normalize_threads":
       return { inputHash: hashJson(readArtifact(runtime, "artifacts/indexes/thread-index.json") || {}), promptHash: null, model: null, promptPreview: null };
-    case "analyze.attach_images":
-      return { inputHash: hashJson(loadThreads(runtime).map((thread) => ({ itemId: thread.itemId, attachments: thread.messages.reduce((sum, message) => sum + (message.attachments?.length || 0), 0), generatedImages: thread.messages.reduce((sum, message) => sum + (message.generatedImages?.length || 0), 0) }))), promptHash: null, model: null, promptPreview: null };
-    case "ai.generate_category_candidates": {
-      if (runtime.config.freezeCategories) {
-        const categories = readCategoryMaster(runtime) || {};
-        return { inputHash: hashJson({ frozen: true, categories }), promptHash: hashText("ai.generate_category_candidates/frozen/v1"), model: resolveModelForTask(runtime, "ai.generate_category_candidates"), promptPreview: "カテゴリ候補生成（固定カテゴリ再利用）" };
+      case "analyze.attach_images":
+        return { inputHash: hashJson(loadThreads(runtime).map((thread) => ({ itemId: thread.itemId, attachments: thread.messages.reduce((sum, message) => sum + (message.attachments?.length || 0), 0), generatedImages: thread.messages.reduce((sum, message) => sum + (message.generatedImages?.length || 0), 0) }))), promptHash: null, model: null, promptPreview: null };
+      case "ai.generate_category_candidates": {
+        const groups = normalizeCategoryGroups(runtime.config.categoryGroups);
+        return aiMeta(runtime, "initialize category master from configured top-level groups", { groups });
       }
-      const sample = loadScopedThreads(runtime).slice(0, 200).map((thread) => ({ itemId: thread.itemId, title: thread.title, primaryDate: thread.primaryDate, preview: thread.preview, generatedImageCount: thread.generatedImageCount }));
-      const prompt = renderPromptTemplate("ai.generate_category_candidates", {
-        maxCategories: runtime.config.maxCategories,
-        sampleJson: JSON.stringify(sample, null, 2)
-      });
-      return aiMeta(runtime, prompt, { maxCategories: runtime.config.maxCategories, sample });
-    }
-    case "ai.classify_thread": {
-      const thread = readThread(item.itemId);
-      const categories = readCategoryMaster(runtime) || {};
-      return { inputHash: hashJson({ categories, thread }), promptHash: hashText("ai.classify_thread/adaptive-split/v1"), model: resolveModelForTask(runtime, "ai.classify_thread"), promptPreview: "スレッド分類（コンテキスト超過時のみ adaptive split）" };
-    }
-    case "ai.extract_findings": {
-      const thread = readThread(item.itemId);
-      return { inputHash: hashJson(thread), promptHash: hashText("ai.extract_findings/adaptive-split/v1"), model: resolveModelForTask(runtime, "ai.extract_findings"), promptPreview: "スレッド findings 抽出（コンテキスト超過時のみ adaptive split）" };
-    }
-    case "analyze.group_units":
-      return { inputHash: hashJson({ grouping: runtime.config.grouping, targetThreadItemIds: runtime.config.targetThreadItemIds || null, threads: loadScopedThreadIndex(runtime), classifications: [...loadScopedClassifications(runtime).entries()] }), promptHash: null, model: null, promptPreview: null };
+      case "analyze.split_thread_turns": {
+        const thread = readThread(item.itemId);
+        return { inputHash: hashJson(thread), promptHash: null, model: null, promptPreview: null };
+      }
+      case "ai.summarize_turn": {
+        const turn = compactTurnForAi(readTurn(runtime, item.itemId));
+        const prompt = renderPromptTemplate("ai.summarize_turn", {
+          payloadJson: JSON.stringify(turn, null, 2)
+        });
+        return aiMeta(runtime, prompt, turn);
+      }
+      case "ai.classify_turn": {
+        const turn = compactTurnForAi(readTurn(runtime, item.itemId));
+        const categories = readCategoryMaster(runtime) || {};
+        const prompt = renderPromptTemplate("ai.classify_thread", {
+          categoryGroupsJson: JSON.stringify(categories.groups || [], null, 2),
+          flatCategoriesJson: JSON.stringify(categories.categories || [], null, 2),
+          payloadJson: JSON.stringify(turn, null, 2)
+        });
+        return aiMeta(runtime, prompt, { categories, turn });
+      }
+      case "ai.merge_thread_turns": {
+        const turns = loadTurnsForThread(runtime, item.itemId);
+        const rawTurnClassifications = turns
+          .map((turn) => readArtifact(runtime, `artifacts/ai/turn_classification/${turn.itemId}.json`))
+          .filter(Boolean);
+        const turnSummaries = turns
+          .map((turn) => compactTurnSummaryForMerge(readArtifact(runtime, `artifacts/ai/turn_summaries/${turn.itemId}.json`)))
+          .filter(Boolean);
+        const categories = readCategoryMaster(runtime) || {};
+        const mergedClassification = compactMergedClassificationForMerge(mergeClassificationResults(rawTurnClassifications), categories);
+        const payload = {
+          thread: compactThreadForMerge(readThread(item.itemId)),
+          turnSummaries,
+          mergedClassification
+        };
+        const prompt = renderPromptTemplate("ai.merge_thread_turns", {
+          payloadJson: JSON.stringify(payload, null, 2)
+        });
+        return aiMeta(runtime, prompt, payload);
+      }
+      case "analyze.group_units":
+        return { inputHash: hashJson({ grouping: runtime.config.grouping, targetThreadItemIds: runtime.config.targetThreadItemIds || null, threads: loadScopedThreadIndex(runtime), classifications: [...loadScopedClassifications(runtime).entries()] }), promptHash: null, model: null, promptPreview: null };
       case "ai.summarize_unit": {
         const unit = readUnit(runtime, item.itemId);
         const availableThreadItemIds = (unit.threadItemIds || []).filter((threadItemId) => hasThreadSummaryInputs(runtime, threadItemId));
         const payload = {
           grouping: runtime.config.grouping,
-          unit: {
-            ...unit,
-            threadItemIds: availableThreadItemIds,
-            omittedThreadItemIds: (unit.threadItemIds || []).filter((threadItemId) => !availableThreadItemIds.includes(threadItemId))
-          },
-          threads: availableThreadItemIds.map((threadItemId) => readThread(threadItemId)),
-          classifications: availableThreadItemIds.map((threadItemId) => readArtifact(runtime, `artifacts/ai/thread_classification/${threadItemId}.json`)),
-          findings: availableThreadItemIds.map((threadItemId) => readArtifact(runtime, `artifacts/ai/thread_findings/${threadItemId}.json`))
+          unit: compactUnitForAi(unit, availableThreadItemIds),
+          threads: availableThreadItemIds.map((threadItemId) => compactThreadInputsForUnit(runtime, threadItemId)).filter(Boolean)
         };
         const prompt = renderPromptTemplate("ai.summarize_unit", {
           unitId: unit.itemId,
@@ -352,19 +375,21 @@ async function buildTaskMeta(runtime, definition, item) {
       }
     case "ai.write_diary_entry": {
       const entry = readEntry(runtime, item.itemId);
+      const payload = compactEntryForAi(entry);
       const prompt = renderPromptTemplate("ai.write_diary_entry", {
         entryId: entry.itemId,
         entryDate: entry.date,
-        entryJson: JSON.stringify(entry, null, 2)
+        entryJson: JSON.stringify(payload, null, 2)
       });
-      return aiMeta(runtime, prompt, entry);
+      return aiMeta(runtime, prompt, payload);
     }
     case "ai.rewrite_diary_entry": {
       const draft = readArtifact(runtime, `artifacts/ai/diary_drafts/${item.itemId}.json`) || {};
+      const payload = compactDiaryDraftForAi(draft);
       const prompt = renderPromptTemplate("ai.rewrite_diary_entry", {
-        draftJson: JSON.stringify(draft, null, 2)
+        draftJson: JSON.stringify(payload, null, 2)
       });
-      return aiMeta(runtime, prompt, draft);
+      return aiMeta(runtime, prompt, payload);
     }
     case "render.markdown":
       return { inputHash: hashJson({ grouping: runtime.config.grouping, entries: loadDiaryEntries(runtime) }), promptHash: null, model: null, promptPreview: null };
@@ -542,6 +567,17 @@ function buildThreadGroups(thread) {
   }
   if (current) groups.push(finalizeThreadGroup(current, groups.length));
   return groups;
+}
+
+function buildTurnsFromThread(thread) {
+  return buildThreadGroups(thread).map((group, index) => ({
+    itemId: `${thread.itemId}_turn_${String(index + 1).padStart(4, "0")}`,
+    threadItemId: thread.itemId,
+    turnIndex: index + 1,
+    date: group.date || thread.primaryDate || null,
+    promptMessages: group.promptMessages || [],
+    responseMessages: group.responseMessages || []
+  }));
 }
 
 function finalizeThreadGroup(group, index) {
@@ -821,7 +857,7 @@ function mergeCategoryMaster(runtime, proposedCategories, itemId = null) {
       label: category.label,
       description: category.description,
       keywords: category.keywords,
-      sourceTaskKey: "ai.classify_thread",
+      sourceTaskKey: runtime.current.taskKey,
       sourceItemId: itemId,
       adoptedAt: isoJst()
     });
@@ -860,7 +896,7 @@ function mergeCategoryMaster(runtime, proposedCategories, itemId = null) {
     generatedAt: isoJst(),
     runId: runtime.config.runId,
     groups,
-    updatedBy: itemId ? { taskKey: "ai.classify_thread", itemId, at: isoJst() } : current.updatedBy || null
+    updatedBy: itemId ? { taskKey: runtime.current.taskKey, itemId, at: isoJst() } : current.updatedBy || null
   });
   if (itemId) {
     const note = `新しい中カテゴリを category master に追加しました (${normalized.map((category) => `${category.groupId}/${category.id}`).join(", ")})`;
@@ -966,6 +1002,188 @@ function compactThreadForAi(thread, options = {}) {
   };
 }
 
+function compactThreadForMerge(thread) {
+  if (!thread) {
+    return null;
+  }
+  return {
+    itemId: thread.itemId,
+    title: thread.title || "",
+    primaryDate: thread.primaryDate || null,
+    preview: clip(thread.preview || "", 500)
+  };
+}
+
+function compactTurnForAi(turn) {
+  if (!turn) {
+    return null;
+  }
+  return {
+    itemId: turn.itemId,
+    threadItemId: turn.threadItemId,
+    date: turn.date || null,
+    turnIndex: turn.turnIndex || null,
+    promptMessages: serializeMessagesForAi(turn.promptMessages || []),
+    responseMessages: serializeMessagesForAi(turn.responseMessages || [])
+  };
+}
+
+function compactTurnSummaryForMerge(summary) {
+  if (!summary) {
+    return null;
+  }
+  return {
+    turnIndex: Number(summary.turnIndex || 0) || null,
+    date: summary.date || null,
+    userIntent: clip(summary.userIntent || "", 240),
+    assistantResponse: clip(summary.assistantResponse || "", 320),
+    outcome: clip(summary.outcome || "", 240)
+  };
+}
+
+function compactMergedClassificationForMerge(classification, master) {
+  const groupLabels = new Map((master?.groups || []).map((group) => [group.id, group.label]));
+  const categoryLabels = new Map((master?.categories || []).map((category) => [category.id, category.label]));
+  const secondaryCategories = Array.isArray(classification?.secondaryCategories) ? classification.secondaryCategories.slice(0, 2) : [];
+  return {
+    primaryGroup: classification?.primaryGroup || "other",
+    primaryGroupLabel: groupLabels.get(classification?.primaryGroup || "other") || classification?.primaryGroup || "other",
+    primaryCategory: classification?.primaryCategory || classification?.primary || "uncategorized",
+    primaryCategoryLabel: categoryLabels.get(classification?.primaryCategory || classification?.primary || "uncategorized") || classification?.primaryCategory || classification?.primary || "uncategorized",
+    secondaryCategories,
+    secondaryCategoryLabels: secondaryCategories.map((categoryId) => categoryLabels.get(categoryId) || categoryId),
+    reasonHint: classification?.reason || ""
+  };
+}
+
+function compactUnitForAi(unit, availableThreadItemIds) {
+  return {
+    itemId: unit.itemId,
+    label: unit.label || "",
+    date: unit.date || null,
+    entryId: unit.entryId || null,
+    threadItemIds: availableThreadItemIds,
+    omittedThreadItemIds: (unit.threadItemIds || []).filter((threadItemId) => !availableThreadItemIds.includes(threadItemId))
+  };
+}
+
+function compactThreadClassificationForAi(classification) {
+  if (!classification) {
+    return null;
+  }
+  return {
+    primaryGroup: classification.primaryGroup || "",
+    primaryGroupLabel: classification.primaryGroupLabel || classification.primaryGroup || "",
+    primaryCategory: classification.primaryCategory || classification.primary || "",
+    primaryCategoryLabel: classification.primaryCategoryLabel || classification.primaryCategory || classification.primary || "",
+    secondaryCategories: Array.isArray(classification.secondaryCategories) ? classification.secondaryCategories.slice(0, 2) : Array.isArray(classification.secondary) ? classification.secondary.slice(0, 2) : [],
+    secondaryCategoryLabels: Array.isArray(classification.secondaryCategoryLabels) ? classification.secondaryCategoryLabels.slice(0, 2) : [],
+    reason: clip(classification.reason || "", 160)
+  };
+}
+
+function compactThreadFindingsForAi(findings) {
+  if (!findings) {
+    return null;
+  }
+  return {
+    interests: uniqueStrings((findings.interests || []).map((value) => clip(value, 120))).slice(0, 8),
+    questions: (findings.questions || []).map((question) => ({
+      text: clip(question?.text || "", 160),
+      status: normalizeQuestionStatus(question?.status)
+    })).filter((question) => question.text).slice(0, 8),
+    outcomes: uniqueStrings((findings.outcomes || []).map((value) => clip(value, 160))).slice(0, 8),
+    images: (findings.images || []).map((image) => ({
+      path: image?.path || "",
+      note: clip(image?.note || image?.caption || image?.prompt || "", 120)
+    })).filter((image) => image.path || image.note).slice(0, 8),
+    narrative: clip(findings.narrative || "", 400)
+  };
+}
+
+function compactThreadSummaryForAi(summary) {
+  if (!summary) {
+    return null;
+  }
+  return {
+    summaryTitle: clip(summary.summaryTitle || "", 120),
+    narrative: clip(summary.narrative || "", 400)
+  };
+}
+
+function compactThreadInputsForUnit(runtime, threadItemId) {
+  const thread = readArtifact(runtime, `artifacts/normalized/${threadItemId}.json`);
+  const classification = readArtifact(runtime, `artifacts/ai/thread_classification/${threadItemId}.json`);
+  const findings = readArtifact(runtime, `artifacts/ai/thread_findings/${threadItemId}.json`);
+  const summary = readArtifact(runtime, `artifacts/ai/thread_summaries/${threadItemId}.json`);
+  if (!thread || !classification || !findings) {
+    return null;
+  }
+  return {
+    itemId: threadItemId,
+    title: thread.title || "",
+    primaryDate: thread.primaryDate || null,
+    classification: compactThreadClassificationForAi(classification),
+    summary: compactThreadSummaryForAi(summary),
+    findings: compactThreadFindingsForAi(findings)
+  };
+}
+
+function compactUnitSummaryForEntry(summary) {
+  if (!summary) {
+    return null;
+  }
+  return {
+    itemId: summary.itemId,
+    label: summary.label || summary.unitLabel || "",
+    date: summary.date || null,
+    summaryTitle: clip(summary.summaryTitle || "", 120),
+    interests: uniqueStrings((summary.interests || []).map((value) => clip(value, 120))).slice(0, 8),
+    questions: uniqueStrings((summary.questions || []).map((value) => {
+      if (typeof value === "string") return clip(value, 160);
+      return clip(value?.text || "", 160);
+    })).slice(0, 8),
+    outcomes: uniqueStrings((summary.outcomes || []).map((value) => clip(value, 160))).slice(0, 8),
+    narrative: clip(summary.narrative || "", 500),
+    images: (summary.images || []).map((image) => ({
+      path: image?.path || "",
+      note: clip(image?.note || image?.caption || image?.prompt || "", 120)
+    })).filter((image) => image.path || image.note).slice(0, 8)
+  };
+}
+
+function compactEntryForAi(entry) {
+  return {
+    itemId: entry.itemId,
+    date: entry.date,
+    units: (entry.units || []).map((unit) => ({
+      itemId: unit.itemId,
+      label: unit.label || "",
+      date: unit.date || null,
+      threadItemIds: unit.threadItemIds || []
+    })),
+    unitSummaries: (entry.unitSummaries || []).map((summary) => compactUnitSummaryForEntry(summary)).filter(Boolean)
+  };
+}
+
+function compactDiaryDraftForAi(draft) {
+  return {
+    itemId: draft.itemId || "",
+    date: draft.date || null,
+    title: draft.title || "",
+    lead: clip(draft.lead || "", 800),
+    sections: (draft.sections || []).map((section) => ({
+      heading: section?.heading || "",
+      body: clip(section?.body || "", 1600)
+    })),
+    closing: clip(draft.closing || "", 800),
+    images: (draft.images || []).map((image) => ({
+      path: image?.path || "",
+      caption: clip(image?.caption || "", 120)
+    })).filter((image) => image.path || image.caption)
+  };
+}
+
 function resolveDependsOn(runtime, taskKey, itemId) {
   if (taskKey === "prepare.extract_export") return [];
   if (taskKey === "prepare.scan_export") return [taskInstanceId("prepare.extract_export", "run")];
@@ -973,15 +1191,15 @@ function resolveDependsOn(runtime, taskKey, itemId) {
   if (taskKey === "analyze.normalize_threads") return [taskInstanceId("prepare.build_thread_index", "run")];
   if (taskKey === "analyze.attach_images") return [taskInstanceId("analyze.normalize_threads", "run")];
   if (taskKey === "ai.generate_category_candidates") return [taskInstanceId("analyze.attach_images", "run")];
-  if (taskKey === "ai.classify_thread") return runtime.config.freezeCategories
-    ? [taskInstanceId("analyze.attach_images", "run")]
-    : [taskInstanceId("analyze.attach_images", "run"), taskInstanceId("ai.generate_category_candidates", "run")];
-  if (taskKey === "ai.extract_findings") return [taskInstanceId("analyze.attach_images", "run")];
+  if (taskKey === "analyze.split_thread_turns") return [taskInstanceId("analyze.attach_images", "run")];
+  if (taskKey === "ai.summarize_turn") return [taskInstanceId("analyze.split_thread_turns", readTurn(runtime, itemId).threadItemId)];
+  if (taskKey === "ai.classify_turn") return [taskInstanceId("analyze.split_thread_turns", readTurn(runtime, itemId).threadItemId), taskInstanceId("ai.generate_category_candidates", "run")];
+  if (taskKey === "ai.merge_thread_turns") return loadTurnsForThread(runtime, itemId).flatMap((turn) => [taskInstanceId("ai.summarize_turn", turn.itemId), taskInstanceId("ai.classify_turn", turn.itemId)]);
   if (taskKey === "analyze.group_units") return (readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || []).filter((thread) => {
     if (!runtime.config.targetThreadItemIds?.length) return true;
     return runtime.config.targetThreadItemIds.includes(thread.itemId);
-  }).flatMap((thread) => [taskInstanceId("ai.classify_thread", thread.itemId), taskInstanceId("ai.extract_findings", thread.itemId)]);
-  if (taskKey === "ai.summarize_unit") return readUnit(runtime, itemId).threadItemIds.filter((threadItemId) => hasThreadSummaryInputs(runtime, threadItemId)).flatMap((threadItemId) => [taskInstanceId("ai.classify_thread", threadItemId), taskInstanceId("ai.extract_findings", threadItemId)]);
+  }).map((thread) => taskInstanceId("ai.merge_thread_turns", thread.itemId));
+  if (taskKey === "ai.summarize_unit") return readUnit(runtime, itemId).threadItemIds.filter((threadItemId) => hasThreadSummaryInputs(runtime, threadItemId)).map((threadItemId) => taskInstanceId("ai.merge_thread_turns", threadItemId));
   if (taskKey === "ai.write_diary_entry") return readEntry(runtime, itemId).unitSummaries.map((unitSummary) => taskInstanceId("ai.summarize_unit", unitSummary.itemId));
   if (taskKey === "ai.rewrite_diary_entry") return [taskInstanceId("ai.write_diary_entry", itemId)];
   if (taskKey === "render.markdown") return loadDiaryEntries(runtime).map((entry) => taskInstanceId("ai.rewrite_diary_entry", entry.itemId));
@@ -1054,8 +1272,9 @@ function getInvalidation(runtime, definition, item, state, meta, dependsOn) {
 
 function isPersistentAiTask(definition) {
   return Boolean(definition?.isAi && [
-    "ai.classify_thread",
-    "ai.extract_findings",
+    "ai.summarize_turn",
+    "ai.classify_turn",
+    "ai.merge_thread_turns",
     "ai.summarize_unit",
     "ai.write_diary_entry",
     "ai.rewrite_diary_entry"
@@ -1195,8 +1414,10 @@ function matchesRerunScope(taskKey, scopes) {
     return true;
   }
   if (allow.has("thread") && [
-    "ai.classify_thread",
-    "ai.extract_findings"
+    "analyze.split_thread_turns",
+    "ai.summarize_turn",
+    "ai.classify_turn",
+    "ai.merge_thread_turns"
   ].includes(taskKey)) {
     return true;
   }
@@ -1225,6 +1446,9 @@ function matchesTargetThreadFilter(itemType, meta, targetThreadItemIds) {
   if (itemType === "thread") {
     return allow.has(meta.itemId);
   }
+  if (itemType === "turn") {
+    return allow.has(meta.threadItemId);
+  }
   if (itemType === "unit" || itemType === "entry") {
     return (meta.threadItemIds || []).some((threadItemId) => allow.has(threadItemId));
   }
@@ -1238,6 +1462,9 @@ function matchesDateFilter(itemType, meta, date) {
   if (itemType === "thread") {
     return meta.primaryDate === date;
   }
+  if (itemType === "turn") {
+    return meta.date === date;
+  }
   return meta.date === date || meta.itemId === `entry_${date}` || meta.itemId === `unit_date_${date}`;
 }
 
@@ -1248,8 +1475,10 @@ async function runHandler(runtime, taskKey, itemId, meta) {
   if (taskKey === "analyze.normalize_threads") return handleNormalizeThreads(runtime);
   if (taskKey === "analyze.attach_images") return handleAttachImages(runtime);
   if (taskKey === "ai.generate_category_candidates") return handleCategories(runtime, meta);
-  if (taskKey === "ai.classify_thread") return handleClassifyThread(runtime, itemId, meta);
-  if (taskKey === "ai.extract_findings") return handleExtractFindings(runtime, itemId, meta);
+  if (taskKey === "analyze.split_thread_turns") return handleSplitThreadTurns(runtime, itemId);
+  if (taskKey === "ai.summarize_turn") return handleSummarizeTurn(runtime, itemId, meta);
+  if (taskKey === "ai.classify_turn") return handleClassifyTurn(runtime, itemId, meta);
+  if (taskKey === "ai.merge_thread_turns") return handleMergeThreadTurns(runtime, itemId, meta);
   if (taskKey === "analyze.group_units") return handleGroupUnits(runtime);
   if (taskKey === "ai.summarize_unit") return handleSummarizeUnit(runtime, itemId, meta);
   if (taskKey === "ai.write_diary_entry") return handleWriteEntry(runtime, itemId, meta);
@@ -1304,6 +1533,163 @@ function handleAttachImages(runtime) {
     writeArtifact(runtime, `artifacts/normalized/${thread.itemId}.json`, { ...thread, generatedAt: isoJst(), imageStats: { attachments: thread.messages.reduce((sum, message) => sum + (message.attachments?.length || 0), 0), generated: thread.messages.reduce((sum, message) => sum + (message.generatedImages?.length || 0), 0) } });
     artifactPaths.push(`artifacts/normalized/${thread.itemId}.json`);
   }
+  return artifactPaths;
+}
+
+function handleSplitThreadTurns(runtime, itemId) {
+  const thread = readArtifact(runtime, `artifacts/normalized/${itemId}.json`);
+  const turns = buildTurnsFromThread(thread);
+  const index = readArtifact(runtime, "artifacts/indexes/turn-index.json")?.turns || [];
+  const retained = index.filter((turn) => turn.threadItemId !== itemId);
+  const artifactPaths = [];
+  for (const turn of turns) {
+    const meta = {
+      itemId: turn.itemId,
+      threadItemId: itemId,
+      threadTitle: thread.title,
+      date: turn.date || thread.primaryDate || null,
+      turnIndex: turn.turnIndex,
+      promptMessageCount: turn.promptMessages.length,
+      responseMessageCount: turn.responseMessages.length
+    };
+    retained.push(meta);
+    writeArtifact(runtime, `artifacts/turns/${turn.itemId}.json`, {
+      schemaVersion: 1,
+      generatedAt: isoJst(),
+      runId: runtime.config.runId,
+      ...meta,
+      promptMessages: turn.promptMessages,
+      responseMessages: turn.responseMessages
+    });
+    artifactPaths.push(`artifacts/turns/${turn.itemId}.json`);
+  }
+  writeArtifact(runtime, "artifacts/indexes/turn-index.json", {
+    schemaVersion: 1,
+    generatedAt: isoJst(),
+    runId: runtime.config.runId,
+    turns: retained.sort((left, right) => left.itemId.localeCompare(right.itemId, "ja"))
+  });
+  artifactPaths.push("artifacts/indexes/turn-index.json");
+  return artifactPaths;
+}
+
+async function handleSummarizeTurn(runtime, itemId, meta) {
+  const response = await askForJson(runtime, "ai.summarize_turn", itemId, `turn-summary-${itemId}`, meta);
+  const turn = readTurn(runtime, itemId);
+  writeArtifact(runtime, `artifacts/ai/turn_summaries/${itemId}.json`, {
+    schemaVersion: 1,
+    generatedAt: isoJst(),
+    runId: runtime.config.runId,
+    itemId,
+    threadItemId: turn.threadItemId,
+    date: turn.date,
+    turnIndex: turn.turnIndex,
+    userIntent: response.parsed.userIntent || "",
+    assistantResponse: response.parsed.assistantResponse || "",
+    outcome: response.parsed.outcome || "",
+    aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit }
+  });
+  writeRaw(runtime, "ai.summarize_turn", itemId, response.text);
+  return [`artifacts/ai/turn_summaries/${itemId}.json`, `artifacts/raw/ai.summarize_turn/${itemId}.raw.json`];
+}
+
+async function handleClassifyTurn(runtime, itemId, meta) {
+  const turn = readTurn(runtime, itemId);
+  const categories = readCategoryMaster(runtime) || {};
+  const response = await askForJson(runtime, "ai.classify_turn", itemId, `turn-classify-${itemId}`, meta);
+  const masterUpdated = mergeCategoryMaster(runtime, response.parsed.proposedCategories || [], itemId);
+  const categoryLabels = new Map((categories.categories || []).map((category) => [category.id, category.label]));
+  const groupLabels = new Map((categories.groups || []).map((group) => [group.id, group.label]));
+  const primaryGroup = response.parsed.primaryGroup || "other";
+  const primaryCategory = response.parsed.primaryCategory || "uncategorized";
+  const secondaryCategories = Array.isArray(response.parsed.secondaryCategories) ? response.parsed.secondaryCategories : [];
+  const artifactPaths = [`artifacts/ai/turn_classification/${itemId}.json`, `artifacts/raw/ai.classify_turn/${itemId}.raw.json`];
+  if (masterUpdated) {
+    artifactPaths.push("artifacts/ai/category_master.json", "artifacts/ai/categories.json");
+  }
+  writeArtifact(runtime, `artifacts/ai/turn_classification/${itemId}.json`, {
+    schemaVersion: 1,
+    generatedAt: isoJst(),
+    runId: runtime.config.runId,
+    itemId,
+    threadItemId: turn.threadItemId,
+    date: turn.date,
+    turnIndex: turn.turnIndex,
+    primaryGroup,
+    primaryGroupLabel: groupLabels.get(primaryGroup) || primaryGroup,
+    primaryCategory,
+    primaryCategoryLabel: categoryLabels.get(primaryCategory) || primaryCategory,
+    secondaryCategories,
+    secondaryCategoryLabels: secondaryCategories.map((categoryId) => categoryLabels.get(categoryId) || categoryId),
+    reason: response.parsed.reason || "",
+    proposedCategories: Array.isArray(response.parsed.proposedCategories) ? response.parsed.proposedCategories : [],
+    aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit, categoryMasterUpdated: masterUpdated }
+  });
+  writeRaw(runtime, "ai.classify_turn", itemId, response.text);
+  return artifactPaths;
+}
+
+async function handleMergeThreadTurns(runtime, itemId, meta) {
+  const response = await askForJson(runtime, "ai.merge_thread_turns", itemId, `thread-merge-${itemId}`, meta);
+  const categories = readCategoryMaster(runtime) || {};
+  const categoryLabels = new Map((categories.categories || []).map((category) => [category.id, category.label]));
+  const groupLabels = new Map((categories.groups || []).map((group) => [group.id, group.label]));
+  const turnClassifications = loadTurnsForThread(runtime, itemId)
+    .map((turn) => readArtifact(runtime, `artifacts/ai/turn_classification/${turn.itemId}.json`))
+    .filter(Boolean);
+  const mergedClassification = mergeClassificationResults(turnClassifications);
+  const primaryGroup = mergedClassification.primaryGroup || "other";
+  const primaryCategory = mergedClassification.primaryCategory || mergedClassification.primary || "uncategorized";
+  const secondaryCategories = Array.isArray(mergedClassification.secondaryCategories)
+    ? mergedClassification.secondaryCategories
+    : Array.isArray(mergedClassification.secondary)
+      ? mergedClassification.secondary
+      : [];
+  const artifactPaths = [
+    `artifacts/ai/thread_classification/${itemId}.json`,
+    `artifacts/ai/thread_findings/${itemId}.json`,
+    `artifacts/ai/thread_summaries/${itemId}.json`,
+    `artifacts/raw/ai.merge_thread_turns/${itemId}.raw.json`
+  ];
+  writeArtifact(runtime, `artifacts/ai/thread_classification/${itemId}.json`, {
+    schemaVersion: 2,
+    generatedAt: isoJst(),
+    runId: runtime.config.runId,
+    itemId,
+    primaryGroup,
+    primaryGroupLabel: groupLabels.get(primaryGroup) || primaryGroup,
+    primaryCategory,
+    primaryCategoryLabel: categoryLabels.get(primaryCategory) || primaryCategory,
+    secondaryCategories,
+    secondaryCategoryLabels: secondaryCategories.map((categoryId) => categoryLabels.get(categoryId) || categoryId),
+    primary: primaryCategory,
+    secondary: secondaryCategories,
+    reason: response.parsed.reason || mergedClassification.reason || "",
+    proposedCategories: [],
+    aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit, classificationMergedInCode: true }
+  });
+  writeArtifact(runtime, `artifacts/ai/thread_findings/${itemId}.json`, {
+    schemaVersion: 1,
+    generatedAt: isoJst(),
+    runId: runtime.config.runId,
+    itemId,
+    interests: Array.isArray(response.parsed.interests) ? response.parsed.interests : [],
+    questions: Array.isArray(response.parsed.questions) ? response.parsed.questions : [],
+    outcomes: Array.isArray(response.parsed.outcomes) ? response.parsed.outcomes : [],
+    images: Array.isArray(response.parsed.images) ? response.parsed.images : [],
+    narrative: response.parsed.narrative || "",
+    aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit }
+  });
+  writeArtifact(runtime, `artifacts/ai/thread_summaries/${itemId}.json`, {
+    schemaVersion: 1,
+    generatedAt: isoJst(),
+    runId: runtime.config.runId,
+    itemId,
+    summaryTitle: response.parsed.summaryTitle || "",
+    narrative: response.parsed.narrative || "",
+    aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit }
+  });
+  writeRaw(runtime, "ai.merge_thread_turns", itemId, response.text);
   return artifactPaths;
 }
 
@@ -1719,12 +2105,19 @@ function repairJsonText(text) {
   let inString = false;
   let escaped = false;
 
-  for (const char of text) {
-    if (inString) {
-      result += char;
-      if (escaped) {
-        escaped = false;
-        continue;
+    for (const char of text) {
+      if (inString) {
+        if (!escaped && char === "\r") {
+          continue;
+        }
+        if (!escaped && char === "\n") {
+          result += "\\n";
+          continue;
+        }
+        result += char;
+        if (escaped) {
+          escaped = false;
+          continue;
       }
       if (char === "\\") {
         escaped = true;
@@ -1770,6 +2163,7 @@ function writeRaw(runtime, taskKey, itemId, text) { writeArtifact(runtime, `arti
 function writeParseError(runtime, taskKey, itemId, value) { writeArtifact(runtime, `artifacts/raw/${taskKey}/${itemId}.parse-error.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, taskKey, itemId, ...value }); }
 function readUnit(runtime, itemId) { const item = (readArtifact(runtime, "artifacts/units/units.json")?.items || []).find((candidate) => candidate.itemId === itemId); if (!item) throw new Error(`unit が見つかりません: ${itemId}`); return item; }
 function readEntry(runtime, itemId) { const units = (readArtifact(runtime, "artifacts/units/units.json")?.items || []).filter((unit) => unit.entryId === itemId); if (!units.length) throw new Error(`entry が見つかりません: ${itemId}`); return { itemId, date: units[0].date || itemId.replace(/^entry_/, ""), units, unitSummaries: units.map((unit) => readArtifact(runtime, `artifacts/ai/unit_summaries/${unit.itemId}.json`)).filter(Boolean) }; }
+function readTurn(runtime, itemId) { const item = readArtifact(runtime, `artifacts/turns/${itemId}.json`); if (!item) throw new Error(`turn が見つかりません: ${itemId}`); return item; }
 function loadThreads(runtime) { return (readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || []).map((thread) => readArtifact(runtime, `artifacts/normalized/${thread.itemId}.json`)).filter(Boolean); }
 function loadScopedThreads(runtime) {
   const threads = loadThreads(runtime);
@@ -1787,6 +2181,8 @@ function loadScopedThreadIndex(runtime) {
   const allow = new Set(runtime.config.targetThreadItemIds);
   return threads.filter((thread) => allow.has(thread.itemId));
 }
+function loadTurns(runtime) { return (readArtifact(runtime, "artifacts/indexes/turn-index.json")?.turns || []).map((turn) => readArtifact(runtime, `artifacts/turns/${turn.itemId}.json`)).filter(Boolean); }
+function loadTurnsForThread(runtime, threadItemId) { return loadTurns(runtime).filter((turn) => turn.threadItemId === threadItemId); }
 function hasThreadSummaryInputs(runtime, threadItemId) {
   return Boolean(
     readArtifact(runtime, `artifacts/ai/thread_classification/${threadItemId}.json`)

@@ -36,14 +36,26 @@ export const TASK_DEFINITIONS = [
     isAi: true
   },
   {
-    stage: "ai.thread",
-    taskKey: "ai.classify_thread",
+    stage: "analyze",
+    taskKey: "analyze.split_thread_turns",
     itemType: "thread",
+    isAi: false
+  },
+  {
+    stage: "ai.turn",
+    taskKey: "ai.summarize_turn",
+    itemType: "turn",
+    isAi: true
+  },
+  {
+    stage: "ai.turn",
+    taskKey: "ai.classify_turn",
+    itemType: "turn",
     isAi: true
   },
   {
     stage: "ai.thread",
-    taskKey: "ai.extract_findings",
+    taskKey: "ai.merge_thread_turns",
     itemType: "thread",
     isAi: true
   },

@@ -1,0 +1,51 @@
+You are part of a multi-step diary generation pipeline.
+
+Return exactly one valid JSON object.
+Do not output markdown.
+Do not output code fences.
+Do not output explanations.
+Do not output text before or after JSON.
+Use double quotes for all keys and string values.
+All required keys must appear.
+If a field has no information, use "".
+Do not duplicate keys.
+Do not invent facts.
+
+Task:
+Summarize one conversation turn.
+
+A turn consists of:
+- one user request or prompt
+- the assistant response(s) that follow it
+
+Your job is only:
+- summarize what the user wanted
+- summarize how the assistant responded
+- summarize the concrete result of this turn
+
+Do:
+- stay close to the actual turn content
+- keep each field short
+- describe the activity of this turn
+
+Do not:
+- classify the turn
+- write diary prose
+- explain the topic in general
+- invent outcomes that are not visible in this turn
+
+Output schema:
+{
+  "userIntent": "...",
+  "assistantResponse": "...",
+  "outcome": "..."
+}
+
+Strict rules:
+- userIntent must describe what the user asked, checked, or requested
+- assistantResponse must describe what the assistant actually returned or explained
+- outcome must describe the concrete result of this turn
+- if no concrete result exists, use ""
+
+Turn input:
+{{payloadJson}}

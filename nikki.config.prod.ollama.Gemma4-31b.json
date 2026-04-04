@@ -1,6 +1,6 @@
 {
   "zipPath": "./e64f0a16abb95f3c70f239cf9594ac82de32b79111df3299d462d34532a6e805-2026-02-28-08-08-03-106f1c6793ee45fb8cef5be87ad4356a.zip",
-  "outputDir": "./output/prod-main-ollama-qwen3.5-0.8b-thread-000011",
+  "outputDir": "./output/prod-main-ollama-gemma4-31b",
   "grouping": "thread-start-day",
   "provider": "ollama",
   "runtime": {
@@ -11,15 +11,15 @@
       "think": false
     }
   },
-  "model": "qwen3.5:0.8b",
+  "model": "gemma4:31b",
   "taskModels": {
-    "ai.generate_category_candidates": "qwen3.5:0.8b",
-    "ai.summarize_turn": "qwen3.5:0.8b",
-    "ai.classify_turn": "qwen3.5:0.8b",
-    "ai.merge_thread_turns": "qwen3.5:9b",
-    "ai.summarize_unit": "qwen3.5:9b",
-    "ai.write_diary_entry": "qwen3.5:9b",
-    "ai.rewrite_diary_entry": "qwen3.5:9b"
+    "ai.generate_category_candidates": "gemma4:31b",
+    "ai.summarize_turn": "gemma4:31b",
+    "ai.classify_turn": "gemma4:31b",
+    "ai.merge_thread_turns": "gemma4:31b",
+    "ai.summarize_unit": "gemma4:31b",
+    "ai.write_diary_entry": "gemma4:31b",
+    "ai.rewrite_diary_entry": "gemma4:31b"
   },
   "taskThinks": {
     "ai.generate_category_candidates": false,
@@ -36,6 +36,6 @@
   "freezeCategories": false,
   "force": false,
   "targetThreadItemIds": [
-    "thread_000011"
+    "thread_000001"
   ]
 }

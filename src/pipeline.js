@@ -14,6 +14,13 @@ let activeStreamConsoleLabel = null;
 let activeStreamConsoleTrailingNewline = true;
 const promptTemplateCache = new Map();
 
+class GracefulStopError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "GracefulStopError";
+  }
+}
+
 export async function inspectZip(zipPath) {
   const lines = await listZipEntries(zipPath);
   return {
@@ -31,26 +38,46 @@ export async function runPipeline(inputConfig) {
   const runtime = createRuntime(inputConfig);
   acquireRunLock(runtime);
   initRun(runtime);
+  const cleanupSignalHandlers = installGracefulStopHandlers(runtime);
   emitEvent(runtime, { type: "run.started", note: "run を開始しました" });
   writeProgress(runtime, { status: "running", note: "初期化完了", lastEvent: "run.started" });
 
   try {
     for (const definition of TASK_DEFINITIONS) {
+      throwIfStopRequested(runtime);
       const items = enumerateItems(runtime, definition.itemType);
       const runnableItems = registerPlanned(runtime, definition, items);
       for (const item of runnableItems) {
+        throwIfStopRequested(runtime);
         await executeTask(runtime, definition, item);
+        throwIfStopRequested(runtime);
       }
     }
     emitEvent(runtime, { type: "run.completed", note: "完了" });
     writeProgress(runtime, { status: "completed", note: "完了", lastEvent: "run.completed", stage: null, taskKey: null, itemType: null, currentItemId: null, currentTaskInstanceId: null });
     console.log("\n完了");
   } catch (error) {
+    if (error instanceof GracefulStopError) {
+      emitEvent(runtime, { type: "run.stopped", note: error.message });
+      writeProgress(runtime, {
+        status: "stopped",
+        note: error.message,
+        lastEvent: "run.stopped",
+        stage: null,
+        taskKey: null,
+        itemType: null,
+        currentItemId: null,
+        currentTaskInstanceId: null
+      });
+      console.log(`\n停止: ${error.message}`);
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     emitEvent(runtime, { type: "run.failed", note: message });
     writeProgress(runtime, { status: "failed", note: message, lastEvent: "run.failed" });
     throw error;
   } finally {
+    cleanupSignalHandlers();
     await closeAppServerClient();
     releaseRunLock(runtime);
   }
@@ -80,8 +107,55 @@ function createRuntime(config) {
     invalidated: new Set(),
     counts: { total: 0, pending: 0, running: 0, completed: 0, failed: 0, skipped: 0 },
     current: { stage: null, taskKey: null, itemType: null, itemId: null, taskInstanceId: null, promptPreview: null, sentAt: null, lastEvent: null, note: null },
-    lock: null
+    lock: null,
+    stopRequested: false,
+    stopReason: null
   };
+}
+
+function installGracefulStopHandlers(runtime) {
+  let sigintCount = 0;
+  const onSigint = () => {
+    sigintCount += 1;
+    if (sigintCount === 1) {
+      requestGracefulStop(runtime, "Ctrl+C により停止予約しました。現在の task 完了後に停止します。");
+      return;
+    }
+    console.error("\nCtrl+C が再度押されたため即時終了します。");
+    process.exit(130);
+  };
+  process.on("SIGINT", onSigint);
+  return () => {
+    process.off("SIGINT", onSigint);
+  };
+}
+
+function requestGracefulStop(runtime, reason) {
+  if (runtime.stopRequested) {
+    return;
+  }
+  runtime.stopRequested = true;
+  runtime.stopReason = reason;
+  emitEvent(runtime, { type: "run.stop_requested", note: reason });
+  writeProgress(runtime, {
+    status: "running",
+    stage: runtime.current.stage,
+    taskKey: runtime.current.taskKey,
+    itemType: runtime.current.itemType,
+    currentItemId: runtime.current.itemId,
+    currentTaskInstanceId: runtime.current.taskInstanceId,
+    promptPreview: runtime.current.promptPreview,
+    sentAt: runtime.current.sentAt,
+    note: reason,
+    lastEvent: "run.stop_requested"
+  });
+  console.log(`\n停止予約: ${reason}`);
+}
+
+function throwIfStopRequested(runtime) {
+  if (runtime.stopRequested) {
+    throw new GracefulStopError(runtime.stopReason || "停止予約により処理を終了します。");
+  }
 }
 
 function resolveConfiguredProvider(value) {
@@ -357,7 +431,21 @@ async function buildTaskMeta(runtime, definition, item) {
         return aiMeta(runtime, prompt, payload);
       }
       case "analyze.group_units":
-        return { inputHash: hashJson({ grouping: runtime.config.grouping, targetThreadItemIds: runtime.config.targetThreadItemIds || null, threads: loadScopedThreadIndex(runtime), classifications: [...loadScopedClassifications(runtime).entries()] }), promptHash: null, model: null, promptPreview: null };
+        return {
+          inputHash: hashJson({
+            grouping: runtime.config.grouping,
+            targetThreadItemIds: runtime.config.targetThreadItemIds || null,
+            targetDates: runtime.config.targetDates || null,
+            targetWeeks: runtime.config.targetWeeks || null,
+            targetMonths: runtime.config.targetMonths || null,
+            targetYears: runtime.config.targetYears || null,
+            threads: loadScopedThreadIndex(runtime),
+            classifications: [...loadScopedClassifications(runtime).entries()]
+          }),
+          promptHash: null,
+          model: null,
+          promptPreview: null
+        };
       case "ai.summarize_unit": {
         const unit = readUnit(runtime, item.itemId);
         const availableThreadItemIds = (unit.threadItemIds || []).filter((threadItemId) => hasThreadSummaryInputs(runtime, threadItemId));
@@ -948,14 +1036,36 @@ function serializeThreadGroup(group) {
 }
 
 function serializeMessagesForAi(messages) {
-  return messages.map((message) => ({
-    role: message.role,
-    date: message.date,
-    contentType: message.contentType,
-    text: clip(message.text || "", 4000),
-    attachmentCount: Array.isArray(message.attachments) ? message.attachments.length : 0,
-    generatedImageCount: Array.isArray(message.generatedImages) ? message.generatedImages.length : 0
-  }));
+  return messages
+    .filter((message) => shouldIncludeMessageForAi(message))
+    .map((message) => ({
+      role: message.role,
+      date: message.date,
+      contentType: message.contentType,
+      text: clip(message.text || "", 4000),
+      attachmentCount: Array.isArray(message.attachments) ? message.attachments.length : 0,
+      generatedImageCount: Array.isArray(message.generatedImages) ? message.generatedImages.length : 0
+    }));
+}
+
+function shouldIncludeMessageForAi(message) {
+  if (!message) {
+    return false;
+  }
+  const contentType = String(message.contentType || "");
+  const text = String(message.text || "").trim();
+  const attachmentCount = Array.isArray(message.attachments) ? message.attachments.length : 0;
+  const generatedImageCount = Array.isArray(message.generatedImages) ? message.generatedImages.length : 0;
+  if (
+    message.role === "tool"
+    && ["tether_quote", "tether_browsing_display"].includes(contentType)
+    && !text
+    && attachmentCount === 0
+    && generatedImageCount === 0
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function compactThreadForAi(thread, options = {}) {
@@ -1195,10 +1305,9 @@ function resolveDependsOn(runtime, taskKey, itemId) {
   if (taskKey === "ai.summarize_turn") return [taskInstanceId("analyze.split_thread_turns", readTurn(runtime, itemId).threadItemId)];
   if (taskKey === "ai.classify_turn") return [taskInstanceId("analyze.split_thread_turns", readTurn(runtime, itemId).threadItemId), taskInstanceId("ai.generate_category_candidates", "run")];
   if (taskKey === "ai.merge_thread_turns") return loadTurnsForThread(runtime, itemId).flatMap((turn) => [taskInstanceId("ai.summarize_turn", turn.itemId), taskInstanceId("ai.classify_turn", turn.itemId)]);
-  if (taskKey === "analyze.group_units") return (readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || []).filter((thread) => {
-    if (!runtime.config.targetThreadItemIds?.length) return true;
-    return runtime.config.targetThreadItemIds.includes(thread.itemId);
-  }).map((thread) => taskInstanceId("ai.merge_thread_turns", thread.itemId));
+  if (taskKey === "analyze.group_units") return (readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || [])
+    .filter((thread) => threadMatchesTargetScopes(thread, runtime.config))
+    .map((thread) => taskInstanceId("ai.merge_thread_turns", thread.itemId));
   if (taskKey === "ai.summarize_unit") return readUnit(runtime, itemId).threadItemIds.filter((threadItemId) => hasThreadSummaryInputs(runtime, threadItemId)).map((threadItemId) => taskInstanceId("ai.merge_thread_turns", threadItemId));
   if (taskKey === "ai.write_diary_entry") return readEntry(runtime, itemId).unitSummaries.map((unitSummary) => taskInstanceId("ai.summarize_unit", unitSummary.itemId));
   if (taskKey === "ai.rewrite_diary_entry") return [taskInstanceId("ai.write_diary_entry", itemId)];
@@ -1337,6 +1446,26 @@ function validateRunOptions(runtime) {
   if (runtime.config.date && !/^\d{4}-\d{2}-\d{2}$/.test(runtime.config.date)) {
     throw new Error(`--date の形式が不正です: ${runtime.config.date}`);
   }
+  for (const value of runtime.config.targetDates || []) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+      throw new Error(`targetDates の形式が不正です: ${value}`);
+    }
+  }
+  for (const value of runtime.config.targetWeeks || []) {
+    if (!/^\d{4}-\d{2}-W[1-5]$/.test(value)) {
+      throw new Error(`targetWeeks の形式が不正です: ${value}`);
+    }
+  }
+  for (const value of runtime.config.targetMonths || []) {
+    if (!/^\d{4}-\d{2}$/.test(value)) {
+      throw new Error(`targetMonths の形式が不正です: ${value}`);
+    }
+  }
+  for (const value of runtime.config.targetYears || []) {
+    if (!/^\d{4}$/.test(value)) {
+      throw new Error(`targetYears の形式が不正です: ${value}`);
+    }
+  }
   if (runtime.config.limit !== null && runtime.config.limit <= 0) {
     throw new Error(`--limit は 1 以上で指定してください: ${runtime.config.limit}`);
   }
@@ -1364,8 +1493,8 @@ function applyItemFilters(runtime, definition, items) {
     const allow = new Set(runtime.config.itemIds);
     filtered = filtered.filter((item) => allow.has(item.itemId));
   }
-  if (runtime.config.targetThreadItemIds?.length) {
-    filtered = filtered.filter((item) => matchesTargetThreadFilter(definition.itemType, item.meta || item, runtime.config.targetThreadItemIds));
+  if (hasTargetThreadScope(runtime.config)) {
+    filtered = filtered.filter((item) => matchesTargetThreadFilter(runtime, definition.itemType, item.meta || item));
   }
   if (runtime.config.date) {
     filtered = filtered.filter((item) => matchesDateFilter(definition.itemType, item.meta || item, runtime.config.date));
@@ -1435,22 +1564,21 @@ function matchesRerunScope(taskKey, scopes) {
   return false;
 }
 
-function matchesTargetThreadFilter(itemType, meta, targetThreadItemIds) {
-  const allow = new Set(targetThreadItemIds || []);
-  if (!allow.size) {
+function matchesTargetThreadFilter(runtime, itemType, meta) {
+  if (!hasTargetThreadScope(runtime.config)) {
     return true;
   }
   if (itemType === "run") {
     return true;
   }
   if (itemType === "thread") {
-    return allow.has(meta.itemId);
+    return threadMatchesTargetScopes(meta, runtime.config);
   }
   if (itemType === "turn") {
-    return allow.has(meta.threadItemId);
+    return threadItemMatchesTargetScopes(runtime, meta.threadItemId);
   }
   if (itemType === "unit" || itemType === "entry") {
-    return (meta.threadItemIds || []).some((threadItemId) => allow.has(threadItemId));
+    return (meta.threadItemIds || []).some((threadItemId) => threadItemMatchesTargetScopes(runtime, threadItemId));
   }
   return true;
 }
@@ -1763,7 +1891,7 @@ function handleGroupUnits(runtime) {
   const existing = readArtifact(runtime, "artifacts/units/units.json")?.items || [];
   const allThreads = readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || [];
   const targetThreadItemIds = new Set(runtime.config.targetThreadItemIds || []);
-  const scopedThreads = targetThreadItemIds.size > 0 ? allThreads.filter((thread) => targetThreadItemIds.has(thread.itemId)) : allThreads;
+  const scopedThreads = hasTargetThreadScope(runtime.config) ? allThreads.filter((thread) => threadMatchesTargetScopes(thread, runtime.config)) : allThreads;
   const affectedDates = runtime.config.date
     ? new Set([runtime.config.date])
     : new Set(scopedThreads.map((thread) => thread.primaryDate || "unknown"));
@@ -1776,10 +1904,10 @@ function handleGroupUnits(runtime) {
     if (runtime.config.grouping !== "category" && affectedDates.size > 0 && !affectedDates.has(date)) {
       continue;
     }
-    if (targetThreadItemIds.size > 0 && runtime.config.grouping === "category" && !targetThreadItemIds.has(thread.itemId)) {
+    if (hasTargetThreadScope(runtime.config) && runtime.config.grouping === "category" && !threadMatchesTargetScopes(thread, runtime.config)) {
       continue;
     }
-    if (targetThreadItemIds.size > 0 && runtime.config.grouping !== "category" && !targetThreadItemIds.has(thread.itemId) && !hasThreadSummaryInputs(runtime, thread.itemId)) {
+    if (hasTargetThreadScope(runtime.config) && runtime.config.grouping !== "category" && !threadMatchesTargetScopes(thread, runtime.config) && !hasThreadSummaryInputs(runtime, thread.itemId)) {
       continue;
     }
     const classification = classes.get(thread.itemId);
@@ -1918,6 +2046,9 @@ async function askForJson(runtime, taskKey, itemId, name, meta) {
     const prompt = parseAttempt === 1 ? meta.prompt : buildJsonRepairPrompt(meta.prompt);
     const promptPath = path.join(dir, `${name.replace(/[^a-zA-Z0-9-_]/g, "_")}${parseAttempt > 1 ? `__retry${parseAttempt}` : ""}.prompt.txt`);
     fs.writeFileSync(promptPath, ["あなたは JSON のみを返す情報整理アシスタントです。", "前置き、説明、コードブロックは禁止です。", "コマンド実行、ファイル変更、ツール使用は禁止です。", "必ず単一の JSON オブジェクトだけを返してください。", "", prompt].join("\n"), "utf8");
+    if (runtime.config.provider === "ollama") {
+      logTextBlock("system", `${taskKey}__${itemId}${parseAttempt > 1 ? ` retry=${parseAttempt}` : ""}`, getOllamaSystemPrompt(runtime.config));
+    }
     logTextBlock("prompt", `${taskKey}__${itemId}${parseAttempt > 1 ? ` retry=${parseAttempt}` : ""}`, prompt);
     const text = await runAiWithRetry(runtime, taskKey, itemId, async () => client.runJsonTurn({
       model: meta.model,
@@ -2012,12 +2143,12 @@ function extractRequestId(message) {
 
 function isRetryableAiText(text) {
   const normalized = String(text || "").trim();
-  return /^Error:/i.test(normalized) && /(429|rate limit|temporar|timeout|ECONNRESET|socket hang up|service unavailable|too many requests|invalid_request_body|fetch failed|internal error|-32603)/i.test(normalized);
+  return /^Error:/i.test(normalized) && /(429|rate limit|temporar|timeout|ECONNRESET|socket hang up|service unavailable|too many requests|invalid_request_body|fetch failed|internal error|-32603|同一行を繰り返したため中断しました)/i.test(normalized);
 }
 
 function isRetryableAiFailure(error) {
   const message = error instanceof Error ? error.message : String(error);
-  return /(429|rate limit|temporar|timeout|ECONNRESET|socket hang up|service unavailable|too many requests|invalid_request_body|fetch failed|internal error|-32603)/i.test(message);
+  return /(429|rate limit|temporar|timeout|ECONNRESET|socket hang up|service unavailable|too many requests|invalid_request_body|fetch failed|internal error|-32603|同一行を繰り返したため中断しました)/i.test(message);
 }
 
 function isContextOverflowFailure(error) {
@@ -2033,9 +2164,13 @@ function buildJsonRepairPrompt(prompt) {
   return [
     prompt,
     "",
-    "前回の応答は JSON 構文が壊れていました。",
-    "今回は必ず JSON 構文として正しい単一の JSON オブジェクトだけを返してください。",
-    "配列やオブジェクトを壊さず、重複キーや途中で切れた配列を作らないでください。"
+    "追加の厳格ルール:",
+    "- 必ず JSON 構文として正しい単一の JSON オブジェクトだけを返してください。",
+    "- 説明文、Markdown、コードブロック、前置きは返さないでください。",
+    "- キーは重複させないでください。",
+    "- 配列やオブジェクトを途中で切らないでください。",
+    "- 文字列値の中に生の改行を入れないでください。",
+    "- スキーマは上の指示に厳密に従ってください。"
   ].join("\n");
 }
 
@@ -2099,13 +2234,15 @@ function repairJsonText(text) {
     .replaceAll("」", "\"")
     .replaceAll("’", "'")
     .replaceAll("‘", "'");
+  text = text.replace(/\\\\",\\n\s+\\"(userIntent|assistantResponse|outcome)\\":/g, (_match, key) => `",\n  "${key}":`);
   text = text.replace(/\]\s*,\s*\[/g, ",");
   text = repairMalformedKeywordsField(text);
   let result = "";
   let inString = false;
   let escaped = false;
 
-    for (const char of text) {
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
       if (inString) {
         if (!escaped && char === "\r") {
           continue;
@@ -2114,20 +2251,26 @@ function repairJsonText(text) {
           result += "\\n";
           continue;
         }
+        if (!escaped && char === "\"") {
+          if (isLikelyStringTerminator(text, index)) {
+            result += char;
+            inString = false;
+            continue;
+          }
+          result += "\\\"";
+          continue;
+        }
         result += char;
         if (escaped) {
           escaped = false;
           continue;
-      }
-      if (char === "\\") {
-        escaped = true;
+        }
+        if (char === "\\") {
+          escaped = true;
+          continue;
+        }
         continue;
       }
-      if (char === "\"") {
-        inString = false;
-      }
-      continue;
-    }
 
     if (char === "\"") {
       inString = true;
@@ -2141,6 +2284,17 @@ function repairJsonText(text) {
   }
 
   return result.trim() || null;
+}
+
+function isLikelyStringTerminator(text, index) {
+  for (let cursor = index + 1; cursor < text.length; cursor += 1) {
+    const char = text[cursor];
+    if (char === " " || char === "\t" || char === "\r" || char === "\n") {
+      continue;
+    }
+    return char === ":" || char === "," || char === "}" || char === "]";
+  }
+  return true;
 }
 
 function repairMalformedKeywordsField(text) {
@@ -2167,19 +2321,17 @@ function readTurn(runtime, itemId) { const item = readArtifact(runtime, `artifac
 function loadThreads(runtime) { return (readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || []).map((thread) => readArtifact(runtime, `artifacts/normalized/${thread.itemId}.json`)).filter(Boolean); }
 function loadScopedThreads(runtime) {
   const threads = loadThreads(runtime);
-  if (!runtime.config.targetThreadItemIds?.length) {
+  if (!hasTargetThreadScope(runtime.config)) {
     return threads;
   }
-  const allow = new Set(runtime.config.targetThreadItemIds);
-  return threads.filter((thread) => allow.has(thread.itemId));
+  return threads.filter((thread) => threadMatchesTargetScopes(thread, runtime.config));
 }
 function loadScopedThreadIndex(runtime) {
   const threads = readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || [];
-  if (!runtime.config.targetThreadItemIds?.length) {
+  if (!hasTargetThreadScope(runtime.config)) {
     return threads;
   }
-  const allow = new Set(runtime.config.targetThreadItemIds);
-  return threads.filter((thread) => allow.has(thread.itemId));
+  return threads.filter((thread) => threadMatchesTargetScopes(thread, runtime.config));
 }
 function loadTurns(runtime) { return (readArtifact(runtime, "artifacts/indexes/turn-index.json")?.turns || []).map((turn) => readArtifact(runtime, `artifacts/turns/${turn.itemId}.json`)).filter(Boolean); }
 function loadTurnsForThread(runtime, threadItemId) { return loadTurns(runtime).filter((turn) => turn.threadItemId === threadItemId); }
@@ -2192,11 +2344,71 @@ function hasThreadSummaryInputs(runtime, threadItemId) {
 function loadClassifications(runtime) { return new Map((readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || []).map((thread) => [thread.itemId, readArtifact(runtime, `artifacts/ai/thread_classification/${thread.itemId}.json`)]).filter(([, value]) => value)); }
 function loadScopedClassifications(runtime) {
   const entries = [...loadClassifications(runtime).entries()];
-  if (!runtime.config.targetThreadItemIds?.length) {
+  if (!hasTargetThreadScope(runtime.config)) {
     return new Map(entries);
   }
-  const allow = new Set(runtime.config.targetThreadItemIds);
-  return new Map(entries.filter(([threadItemId]) => allow.has(threadItemId)));
+  return new Map(entries.filter(([threadItemId]) => threadItemMatchesTargetScopes(runtime, threadItemId)));
+}
+function hasTargetThreadScope(config) {
+  return Boolean(
+    config?.targetThreadItemIds?.length
+    || config?.targetDates?.length
+    || config?.targetWeeks?.length
+    || config?.targetMonths?.length
+    || config?.targetYears?.length
+  );
+}
+function threadItemMatchesTargetScopes(runtime, threadItemId) {
+  const thread = (readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || []).find((candidate) => candidate.itemId === threadItemId);
+  return threadMatchesTargetScopes(thread, runtime.config);
+}
+function threadMatchesTargetScopes(thread, config) {
+  if (!thread) {
+    return false;
+  }
+  const allow = new Set(config?.targetThreadItemIds || []);
+  if (allow.size > 0 && !allow.has(thread.itemId)) {
+    return false;
+  }
+  const primaryDate = String(thread.primaryDate || "");
+  const targetDates = new Set(config?.targetDates || []);
+  if (targetDates.size > 0 && !targetDates.has(primaryDate)) {
+    return false;
+  }
+  const targetMonths = new Set(config?.targetMonths || []);
+  if (targetMonths.size > 0 && !targetMonths.has(primaryDate.slice(0, 7))) {
+    return false;
+  }
+  const targetYears = new Set(config?.targetYears || []);
+  if (targetYears.size > 0 && !targetYears.has(primaryDate.slice(0, 4))) {
+    return false;
+  }
+  const targetWeeks = new Set(config?.targetWeeks || []);
+  if (targetWeeks.size > 0 && !targetWeeks.has(monthWeekKey(primaryDate))) {
+    return false;
+  }
+  return true;
+}
+function monthWeekKey(date) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date || ""))) {
+    return null;
+  }
+  const [year, month, day] = String(date).split("-").map(Number);
+  const target = new Date(Date.UTC(year, month - 1, day));
+  const targetDayOfWeek = target.getUTCDay() || 7;
+  const weekMonday = new Date(target);
+  weekMonday.setUTCDate(target.getUTCDate() - (targetDayOfWeek - 1));
+  const weekSunday = new Date(weekMonday);
+  weekSunday.setUTCDate(weekMonday.getUTCDate() + 6);
+  const anchorYear = weekSunday.getUTCFullYear();
+  const anchorMonth = weekSunday.getUTCMonth() + 1;
+  const monthStart = new Date(Date.UTC(anchorYear, anchorMonth - 1, 1));
+  const monthStartDayOfWeek = monthStart.getUTCDay() || 7;
+  const firstWeekMonday = new Date(monthStart);
+  firstWeekMonday.setUTCDate(monthStart.getUTCDate() - (monthStartDayOfWeek - 1));
+  const diffDays = Math.floor((weekMonday - firstWeekMonday) / 86400000);
+  const weekOfMonth = Math.floor(diffDays / 7) + 1;
+  return `${anchorYear}-${String(anchorMonth).padStart(2, "0")}-W${weekOfMonth}`;
 }
 function loadDiaryEntries(runtime) { const entryIds = [...new Set((readArtifact(runtime, "artifacts/units/units.json")?.items || []).map((unit) => unit.entryId).filter(Boolean))]; return entryIds.map((entryId) => readArtifact(runtime, `artifacts/ai/diary_entries/${entryId}.json`)).filter(Boolean); }
 function getChangedEntryIds(runtime) {
@@ -3001,17 +3213,16 @@ class OllamaClient {
     this.ollama = config.runtime?.ollama || {};
     this.baseUrl = String(this.ollama.baseUrl || "http://127.0.0.1:11434").replace(/\/+$/, "");
     this.eventLogPath = path.join(config.outputDir, "logs", "ollama-events.log");
+    this.command = String(this.ollama.command || "ollama");
+    this.activeModel = null;
   }
 
   async runJsonTurn({ model, think, cwd, prompt, onProgress }) {
     const preview = clip(prompt.replace(/\s+/g, " "), 220);
     const sentAt = isoJst();
     const finalModel = model || this.config.model;
-    const systemPrompt = this.ollama.system || [
-      "常に日本語で応答してください。",
-      "最終応答は JSON オブジェクトのみ。",
-      "説明文、コードブロック、前置きは禁止。"
-    ].join("\n");
+    await this.ensureModelReady(finalModel, onProgress, preview, sentAt);
+    const systemPrompt = getOllamaSystemPrompt(this.config);
     const body = {
       model: finalModel,
       system: systemPrompt,
@@ -3031,6 +3242,7 @@ class OllamaClient {
       body.options = this.ollama.options;
     }
 
+    onProgress?.({ phase: "system", promptPreview: preview, sentAt, note: "Ollama system prompt を送信します", systemPrompt });
     onProgress?.({ phase: "turn-start", promptPreview: preview, sentAt, note: "Ollama にプロンプト送信中" });
     this.log({ phase: "request", model: finalModel, cwd, promptPreview: preview, think: typeof body.think === "boolean" ? body.think : null });
 
@@ -3057,15 +3269,71 @@ class OllamaClient {
     }
 
     onProgress?.({ phase: "done", promptPreview: preview, sentAt, note: "最終応答の取得完了" });
+    this.activeModel = finalModel;
     return output;
   }
 
   async close() {}
 
+  async ensureModelReady(nextModel, onProgress, preview, sentAt) {
+    if (!nextModel || !this.activeModel || this.activeModel === nextModel) {
+      return;
+    }
+    const oldModel = this.activeModel;
+    const note = `モデル切替のため ${oldModel} をアンロードします`;
+    onProgress?.({ phase: "model-switch", promptPreview: preview, sentAt, note });
+    this.log({ phase: "model-switch", from: oldModel, to: nextModel });
+    await this.stopModel(oldModel);
+    await this.waitForModelUnload(oldModel);
+  }
+
+  async stopModel(model) {
+    try {
+      await execFileAsync(this.command, ["stop", model], { windowsHide: true });
+      this.log({ phase: "model-stop", model, status: "ok" });
+    } catch (error) {
+      this.log({ phase: "model-stop", model, status: "failed", error: String(error instanceof Error ? error.message : error) });
+    }
+  }
+
+  async waitForModelUnload(model) {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const loaded = await this.listLoadedModels();
+      if (!loaded.includes(model)) {
+        this.log({ phase: "model-unloaded", model, attempts: attempt + 1 });
+        return;
+      }
+      await sleep(500);
+    }
+    this.log({ phase: "model-unload-timeout", model });
+  }
+
+  async listLoadedModels() {
+    try {
+      const { stdout } = await execFileAsync(this.command, ["ps"], { windowsHide: true, maxBuffer: 1024 * 1024 });
+      return parseOllamaPsModels(stdout);
+    } catch (error) {
+      this.log({ phase: "model-ps", status: "failed", error: String(error instanceof Error ? error.message : error) });
+      return [];
+    }
+  }
+
   log(entry) {
     ensureDir(path.dirname(this.eventLogPath));
     fs.appendFileSync(this.eventLogPath, `${JSON.stringify({ at: isoJst(), provider: "ollama", ...entry })}\n`, "utf8");
   }
+}
+
+function getOllamaSystemPrompt(config) {
+  return config?.runtime?.ollama?.system || [
+    "常に日本語で応答してください。",
+    "Respond in Japanese.",
+    "Return exactly one JSON object.",
+    "Do not output markdown.",
+    "Do not output code fences.",
+    "Do not output explanations.",
+    "Do not output any text before or after JSON."
+  ].join("\n");
 }
 
 function normalizeHeaders(value) {
@@ -3089,6 +3357,16 @@ function extractOllamaErrorMessage(status, text) {
   return `Ollama error (${status}): ${clip(text || "unknown error", 400)}`;
 }
 
+function parseOllamaPsModels(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .slice(1)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.split(/\s{2,}/)[0]?.trim())
+    .filter(Boolean);
+}
+
 async function readOllamaStream(response, context) {
   if (!response.body) {
     throw new Error("Ollama のストリームを取得できませんでした。");
@@ -3099,6 +3377,8 @@ async function readOllamaStream(response, context) {
   let output = "";
   let thinking = "";
   let sawDone = false;
+  let responseLineBuffer = "";
+  let recentResponseLines = [];
 
   while (true) {
     const { value, done } = await reader.read();
@@ -3130,6 +3410,19 @@ async function readOllamaStream(response, context) {
         }
         if (responseChunk) {
           output += responseChunk;
+          const repetition = detectRepeatedResponseLine(responseChunk, {
+            lineBuffer: responseLineBuffer,
+            recentLines: recentResponseLines
+          });
+          responseLineBuffer = repetition.lineBuffer;
+          recentResponseLines = repetition.recentLines;
+          if (repetition.abort) {
+            context.log({ phase: "response-loop-detected", line: repetition.repeatedLine, count: repetition.repeatedLineCount });
+            try {
+              await reader.cancel("repeated response line detected");
+            } catch {}
+            throw new Error(`Ollama 応答が同一行を繰り返したため中断しました: ${clip(repetition.repeatedLine || "", 120)} (count=${repetition.repeatedLineCount})`);
+          }
           context.log({ phase: "response-chunk", preview: clip(responseChunk, 200) });
           context.onProgress?.({ phase: "agent-message", promptPreview: context.preview, sentAt: context.sentAt, note: `応答生成中: ${clip(responseChunk, 80)}`, deltaText: responseChunk });
         }
@@ -3159,6 +3452,19 @@ async function readOllamaStream(response, context) {
     }
     if (responseChunk) {
       output += responseChunk;
+      const repetition = detectRepeatedResponseLine(responseChunk, {
+        lineBuffer: responseLineBuffer,
+        recentLines: recentResponseLines
+      });
+      responseLineBuffer = repetition.lineBuffer;
+      recentResponseLines = repetition.recentLines;
+      if (repetition.abort) {
+        context.log({ phase: "response-loop-detected", line: repetition.repeatedLine, count: repetition.repeatedLineCount });
+        try {
+          await reader.cancel("repeated response line detected");
+        } catch {}
+        throw new Error(`Ollama 応答が同一行を繰り返したため中断しました: ${clip(repetition.repeatedLine || "", 120)} (count=${repetition.repeatedLineCount})`);
+      }
       context.log({ phase: "response-chunk", preview: clip(responseChunk, 200) });
       context.onProgress?.({ phase: "agent-message", promptPreview: context.preview, sentAt: context.sentAt, note: `応答生成中: ${clip(responseChunk, 80)}`, deltaText: responseChunk });
     }
@@ -3169,6 +3475,34 @@ async function readOllamaStream(response, context) {
     context.log({ phase: "thinking", preview: clip(thinking, 500) });
   }
   return { output, thinking, done: sawDone };
+}
+
+function detectRepeatedResponseLine(chunk, state) {
+  let lineBuffer = `${state.lineBuffer || ""}${String(chunk || "")}`;
+  let recentLines = Array.isArray(state.recentLines) ? [...state.recentLines] : [];
+
+  while (true) {
+    const newlineIndex = lineBuffer.indexOf("\n");
+    if (newlineIndex < 0) {
+      break;
+    }
+    const rawLine = lineBuffer.slice(0, newlineIndex);
+    lineBuffer = lineBuffer.slice(newlineIndex + 1);
+    const normalized = rawLine.trim();
+    if (!normalized || normalized.length <= 2) {
+      continue;
+    }
+    recentLines.push(normalized);
+    if (recentLines.length > 100) {
+      recentLines = recentLines.slice(recentLines.length - 100);
+    }
+    const repeatedLineCount = recentLines.filter((line) => line === normalized).length;
+    if (repeatedLineCount >= 10) {
+      return { lineBuffer, recentLines, repeatedLine: normalized, repeatedLineCount, abort: true };
+    }
+  }
+
+  return { lineBuffer, recentLines, repeatedLine: null, repeatedLineCount: 0, abort: false };
 }
 
 function parseOllamaStreamChunk(line) {

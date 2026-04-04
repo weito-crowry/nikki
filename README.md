@@ -91,6 +91,10 @@ npm run run:prod:ollama:qwen3.5-0.8b
 - `summaryLanguage`
 - `freezeCategories`
 - `targetThreadItemIds`
+- `targetDates`
+- `targetWeeks`
+- `targetMonths`
+- `targetYears`
 
 例:
 
@@ -117,6 +121,9 @@ npm run run:prod:ollama:qwen3.5-0.8b
     "ai.rewrite_diary_entry": "gpt-5-mini"
   },
   "freezeCategories": true,
+  "targetDates": ["2024-08-16", "2024-08-18"],
+  "targetWeeks": ["2024-08-W3"],
+  "targetMonths": ["2024-08"],
   "targetThreadItemIds": [
     "thread_000001",
     "thread_000002"
@@ -194,6 +201,12 @@ AI の再実行は極力抑える前提です。
 - thread classification / findings は artifact と AI cache を再利用
 - split plan も再利用
 - `targetThreadItemIds` で対象 thread を絞れる
+- `targetDates` / `targetWeeks` / `targetMonths` / `targetYears` でも `primaryDate` ベースで対象 thread を絞れる
+- `targetWeeks` は `2024-08-W3` のような「2024年8月の第3週」形式
+- 週は月曜始まり・日曜終わりで、各月の1日を含む週を第1週とする
+- 例: `2026-03-31` は `2026-04-W1`
+- `--target-date 2024-08-16,2024-08-18` のように複数指定できる
+- `--date` は再実行対象日指定、`--target-date` などは処理対象 thread の絞り込み
 - `group_units` は影響日だけ差し替える方向
 - render は日付別 post を持ち、変更 entry を中心に更新
 

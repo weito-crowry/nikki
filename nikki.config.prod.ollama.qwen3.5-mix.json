@@ -1,6 +1,6 @@
 {
   "zipPath": "./e64f0a16abb95f3c70f239cf9594ac82de32b79111df3299d462d34532a6e805-2026-02-28-08-08-03-106f1c6793ee45fb8cef5be87ad4356a.zip",
-  "outputDir": "./output/prod-main-ollama-qwen3.5-0.8b-thread-000011",
+  "outputDir": "./output/prod-main-ollama-qwen3.5-mix",
   "grouping": "thread-start-day",
   "provider": "ollama",
   "runtime": {
@@ -11,11 +11,11 @@
       "think": false
     }
   },
-  "model": "qwen3.5:0.8b",
+  "model": "qwen3.5:9b",
   "taskModels": {
-    "ai.generate_category_candidates": "qwen3.5:0.8b",
-    "ai.summarize_turn": "qwen3.5:0.8b",
-    "ai.classify_turn": "qwen3.5:0.8b",
+    "ai.generate_category_candidates": "qwen3.5:9b",
+    "ai.summarize_turn": "qwen3.5:9b",
+    "ai.classify_turn": "qwen3.5:9b",
     "ai.merge_thread_turns": "qwen3.5:9b",
     "ai.summarize_unit": "qwen3.5:9b",
     "ai.write_diary_entry": "qwen3.5:9b",
@@ -36,6 +36,25 @@
   "freezeCategories": false,
   "force": false,
   "targetThreadItemIds": [
-    "thread_000011"
+    "thread_000001",
+    "thread_000002",
+    "thread_000003",
+    "thread_000004",
+    "thread_000005",
+    "thread_000006",
+    "thread_000007",
+    "thread_000008",
+    "thread_000009",
+    "thread_000010",
+    "thread_000011",
+    "thread_000012",
+    "thread_000013",
+    "thread_000014",
+    "thread_000015",
+    "thread_000016",
+    "thread_000017",
+    "thread_000018",
+    "thread_000019",
+    "thread_000020"
   ]
 }

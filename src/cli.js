@@ -33,6 +33,10 @@ function resolveConfig(options, positionals = []) {
   const fileConfig = configPath && fs.existsSync(configPath)
     ? JSON.parse(fs.readFileSync(configPath, "utf8"))
     : {};
+  const targetDates = mergeListValues(options["target-date"], fileConfig.targetDates ?? fileConfig.targetDate ?? null);
+  const targetWeeks = mergeListValues(options["target-week"], fileConfig.targetWeeks ?? fileConfig.targetWeek ?? null);
+  const targetMonths = mergeListValues(options["target-month"], fileConfig.targetMonths ?? fileConfig.targetMonth ?? null);
+  const targetYears = mergeListValues(options["target-year"], fileConfig.targetYears ?? fileConfig.targetYear ?? null);
 
   const merged = {
     zipPath: options.zip ?? positionals[0] ?? fileConfig.zipPath,
@@ -55,6 +59,10 @@ function resolveConfig(options, positionals = []) {
     rerunScopes: splitList(options["rerun-scope"] ?? fileConfig.rerunScopes ?? null),
     itemIds: splitList(options["item-id"] ?? fileConfig.itemIds ?? null),
     targetThreadItemIds: splitList(options["thread-id"] ?? fileConfig.targetThreadItemIds ?? null),
+    targetDates,
+    targetWeeks,
+    targetMonths,
+    targetYears,
     date: options.date ?? fileConfig.date ?? null,
     limit: toOptionalNumber(options.limit ?? fileConfig.limit ?? null)
   };
@@ -73,7 +81,9 @@ function resolveConfig(options, positionals = []) {
 function printUsage() {
   console.log(`使い方:
   node src/cli.js run --zip <zip> --output <dir> [--group-by thread-start-day|message-day|category] [--force]
-    [--only <taskKey[,taskKey...]>] [--rerun-scope <thread[,unit]>] [--item-id <id[,id...]>] [--thread-id <id[,id...]>] [--date YYYY-MM-DD] [--limit N]
+    [--only <taskKey[,taskKey...]>] [--rerun-scope <thread[,unit]>] [--item-id <id[,id...]>] [--thread-id <id[,id...]>]
+    [--target-date YYYY-MM-DD] [--target-week YYYY-MM-Wn] [--target-month YYYY-MM] [--target-year YYYY]
+    [--date YYYY-MM-DD] [--limit N]
     [--retry-failed] [--skip-completed] [--freeze-categories]
   node src/cli.js inspect --zip <zip>
   node src/cli.js run --config ./nikki.config.json`);
@@ -87,6 +97,14 @@ function splitList(value) {
     return value.flatMap((item) => String(item).split(",")).map((item) => item.trim()).filter(Boolean);
   }
   return String(value).split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function mergeListValues(cliValue, fileValue) {
+  const cliList = splitList(cliValue);
+  if (cliList?.length) {
+    return cliList;
+  }
+  return splitList(fileValue);
 }
 
 function toOptionalNumber(value) {

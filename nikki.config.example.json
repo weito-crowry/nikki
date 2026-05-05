@@ -14,5 +14,9 @@
   "maxCategories": 12,
   "categoriesPerMessage": 2,
   "summaryLanguage": "ja",
+  "excludeThreadItemIds": [],
+  "excludeSourceThreadIds": [],
+  "excludeGroupIds": [],
+  "jsonRetryAttempts": 2,
   "force": false
 }

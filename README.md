@@ -95,6 +95,10 @@ npm run run:prod:ollama:qwen3.5-0.8b
 - `targetWeeks`
 - `targetMonths`
 - `targetYears`
+- `excludeThreadItemIds`
+- `excludeSourceThreadIds`
+- `excludeGroupIds`
+- `jsonRetryAttempts`
 
 例:
 
@@ -124,6 +128,9 @@ npm run run:prod:ollama:qwen3.5-0.8b
   "targetDates": ["2024-08-16", "2024-08-18"],
   "targetWeeks": ["2024-08-W3"],
   "targetMonths": ["2024-08"],
+  "excludeThreadItemIds": ["thread_000003"],
+  "excludeGroupIds": ["g-p-692c4c950d748191a6a24fc7e2676e2e"],
+  "jsonRetryAttempts": 4,
   "targetThreadItemIds": [
     "thread_000001",
     "thread_000002"
@@ -200,8 +207,11 @@ AI の再実行は極力抑える前提です。
 
 - thread classification / findings は artifact と AI cache を再利用
 - split plan も再利用
+- Ollama 実行分は取得できた場合のみ `aiMeta.usage` / raw artifact / `events.jsonl` に token usage を保存
+- `jsonRetryAttempts` で JSON 解析失敗時の再実行回数を増やせる。未指定時は従来通り 2 回
 - `targetThreadItemIds` で対象 thread を絞れる
 - `targetDates` / `targetWeeks` / `targetMonths` / `targetYears` でも `primaryDate` ベースで対象 thread を絞れる
+- `excludeThreadItemIds` / `excludeSourceThreadIds` / `excludeGroupIds` で特定 thread や ChatGPT Project/Gizmo ID を除外できる
 - `targetWeeks` は `2024-08-W3` のような「2024年8月の第3週」形式
 - 週は月曜始まり・日曜終わりで、各月の1日を含む週を第1週とする
 - 例: `2026-03-31` は `2026-04-W1`

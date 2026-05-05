@@ -37,6 +37,9 @@ function resolveConfig(options, positionals = []) {
   const targetWeeks = mergeListValues(options["target-week"], fileConfig.targetWeeks ?? fileConfig.targetWeek ?? null);
   const targetMonths = mergeListValues(options["target-month"], fileConfig.targetMonths ?? fileConfig.targetMonth ?? null);
   const targetYears = mergeListValues(options["target-year"], fileConfig.targetYears ?? fileConfig.targetYear ?? null);
+  const excludeThreadItemIds = mergeListValues(options["exclude-thread-id"], fileConfig.excludeThreadItemIds ?? fileConfig.excludeThreadItemId ?? null);
+  const excludeSourceThreadIds = mergeListValues(options["exclude-source-thread-id"], fileConfig.excludeSourceThreadIds ?? fileConfig.excludeSourceThreadId ?? null);
+  const excludeGroupIds = mergeListValues(options["exclude-group-id"], fileConfig.excludeGroupIds ?? fileConfig.excludeGroupId ?? null);
 
   const merged = {
     zipPath: options.zip ?? positionals[0] ?? fileConfig.zipPath,
@@ -63,6 +66,10 @@ function resolveConfig(options, positionals = []) {
     targetWeeks,
     targetMonths,
     targetYears,
+    excludeThreadItemIds,
+    excludeSourceThreadIds,
+    excludeGroupIds,
+    jsonRetryAttempts: toOptionalNumber(options["json-retry-attempts"] ?? fileConfig.jsonRetryAttempts ?? null),
     date: options.date ?? fileConfig.date ?? null,
     limit: toOptionalNumber(options.limit ?? fileConfig.limit ?? null)
   };
@@ -83,6 +90,9 @@ function printUsage() {
   node src/cli.js run --zip <zip> --output <dir> [--group-by thread-start-day|message-day|category] [--force]
     [--only <taskKey[,taskKey...]>] [--rerun-scope <thread[,unit]>] [--item-id <id[,id...]>] [--thread-id <id[,id...]>]
     [--target-date YYYY-MM-DD] [--target-week YYYY-MM-Wn] [--target-month YYYY-MM] [--target-year YYYY]
+    [--exclude-thread-id <thread_000001[,thread_000002...]>] [--exclude-source-thread-id <sourceId[,sourceId...]>]
+    [--exclude-group-id <g-p-...[,g-p-...]>]
+    [--json-retry-attempts N]
     [--date YYYY-MM-DD] [--limit N]
     [--retry-failed] [--skip-completed] [--freeze-categories]
   node src/cli.js inspect --zip <zip>

@@ -32,5 +32,9 @@
   "categoriesPerMessage": 2,
   "summaryLanguage": "ja",
   "freezeCategories": true,
+  "excludeThreadItemIds": [],
+  "excludeSourceThreadIds": [],
+  "excludeGroupIds": [],
+  "jsonRetryAttempts": 3,
   "force": false
 }

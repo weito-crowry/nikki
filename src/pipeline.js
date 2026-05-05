@@ -2,7 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import net from "node:net";
+import http from "node:http";
+import https from "node:https";
 import { execFile, spawn } from "node:child_process";
+import { Readable } from "node:stream";
 import { promisify } from "node:util";
 import { marked } from "marked";
 import { TASK_DEFINITIONS } from "./task-definitions.js";
@@ -380,7 +383,7 @@ async function buildTaskMeta(runtime, definition, item) {
     case "prepare.scan_export":
       return { inputHash: hashJson({ files: walkFiles(runtime.paths.extracted).map((file) => path.relative(runtime.paths.extracted, file).replaceAll("\\", "/")).sort() }), promptHash: null, model: null, promptPreview: null };
     case "prepare.build_thread_index":
-      return { inputHash: hashJson(readArtifact(runtime, "artifacts/manifest/export-manifest.json") || {}), promptHash: null, model: null, promptPreview: null };
+      return { inputHash: hashJson({ schema: "thread-index-v2", manifest: readArtifact(runtime, "artifacts/manifest/export-manifest.json") || {} }), promptHash: null, model: null, promptPreview: null };
     case "analyze.normalize_threads":
       return { inputHash: hashJson(readArtifact(runtime, "artifacts/indexes/thread-index.json") || {}), promptHash: null, model: null, promptPreview: null };
       case "analyze.attach_images":
@@ -439,6 +442,9 @@ async function buildTaskMeta(runtime, definition, item) {
             targetWeeks: runtime.config.targetWeeks || null,
             targetMonths: runtime.config.targetMonths || null,
             targetYears: runtime.config.targetYears || null,
+            excludeThreadItemIds: runtime.config.excludeThreadItemIds || null,
+            excludeSourceThreadIds: runtime.config.excludeSourceThreadIds || null,
+            excludeGroupIds: runtime.config.excludeGroupIds || null,
             threads: loadScopedThreadIndex(runtime),
             classifications: [...loadScopedClassifications(runtime).entries()]
           }),
@@ -513,6 +519,56 @@ function aiProviderLabel(runtime) {
   return "codex-app-server";
 }
 
+function normalizeAiUsage(usage) {
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) {
+    return null;
+  }
+  const normalized = {};
+  for (const [key, value] of Object.entries(usage)) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      normalized[key] = value;
+    } else if (typeof value === "string" && value.trim()) {
+      normalized[key] = value;
+    } else if (typeof value === "boolean") {
+      normalized[key] = value;
+    }
+  }
+  return Object.keys(normalized).length ? normalized : null;
+}
+
+function mergeAiUsages(usages) {
+  const normalized = (usages || []).map((usage) => normalizeAiUsage(usage)).filter(Boolean);
+  if (!normalized.length) {
+    return null;
+  }
+  const result = { chunkCountWithUsage: normalized.length };
+  for (const usage of normalized) {
+    for (const [key, value] of Object.entries(usage)) {
+      if (typeof value === "number" && Number.isFinite(value)) {
+        result[key] = (result[key] || 0) + value;
+      }
+    }
+  }
+  if (typeof result.inputTokens === "number" || typeof result.outputTokens === "number") {
+    result.totalTokens = (result.inputTokens || 0) + (result.outputTokens || 0);
+  }
+  return Object.keys(result).length > 1 ? result : null;
+}
+
+function buildAiMeta(runtime, meta, response, extra = {}) {
+  const usage = normalizeAiUsage(response?.usage);
+  return {
+    model: meta.model,
+    think: meta.think,
+    promptHash: meta.promptHash,
+    inputHash: meta.inputHash,
+    provider: aiProviderLabel(runtime),
+    cacheHit: Boolean(response?.cacheHit),
+    ...(usage ? { usage } : {}),
+    ...extra
+  };
+}
+
 async function askForAdaptiveThreadJson(runtime, options) {
   const savedPlan = readThreadSplitPlan(runtime, options.taskKey, options.itemId);
   if (savedPlan?.leaves?.length) {
@@ -530,6 +586,7 @@ async function askForAdaptiveThreadJson(runtime, options) {
   return {
     parsed: options.mergeParsed(results.map((result) => result.parsed)),
     text: JSON.stringify({ adaptiveSplit: results.length > 1, chunkCount: results.length, chunks: results.map((result) => ({ path: result.path, rawPreview: clip(result.text, 180) })) }, null, 2),
+    usage: mergeAiUsages(results.map((result) => result.usage)),
     cacheHit: results.every((result) => result.cacheHit),
     adaptiveSplit: results.length > 1,
     chunkCount: results.length
@@ -542,7 +599,7 @@ async function collectAdaptiveThreadResults(runtime, options, groups, depth, pat
   const meta = aiMeta(runtime, prompt, { ...options.baseInput, payload, pathKey, depth });
   try {
     const response = await askForJson(runtime, options.taskKey, options.itemId, `${options.name}-${pathKey}`, meta);
-    return [{ parsed: response.parsed, text: response.text, cacheHit: response.cacheHit, path: pathKey, groups }];
+    return [{ parsed: response.parsed, text: response.text, usage: response.usage || null, cacheHit: response.cacheHit, path: pathKey, groups }];
   } catch (error) {
     if (!isContextOverflowFailure(error)) {
       throw error;
@@ -1469,11 +1526,19 @@ function validateRunOptions(runtime) {
   if (runtime.config.limit !== null && runtime.config.limit <= 0) {
     throw new Error(`--limit は 1 以上で指定してください: ${runtime.config.limit}`);
   }
+  if (runtime.config.jsonRetryAttempts !== null && runtime.config.jsonRetryAttempts < 1) {
+    throw new Error(`jsonRetryAttempts は 1 以上で指定してください: ${runtime.config.jsonRetryAttempts}`);
+  }
   if (runtime.config.date && runtime.config.grouping === "category") {
     throw new Error("--group-by category では --date は指定できません。");
   }
   if (runtime.config.targetThreadItemIds && !Array.isArray(runtime.config.targetThreadItemIds)) {
     throw new Error("targetThreadItemIds は配列で指定してください。");
+  }
+  for (const key of ["excludeThreadItemIds", "excludeSourceThreadIds", "excludeGroupIds"]) {
+    if (runtime.config[key] && !Array.isArray(runtime.config[key])) {
+      throw new Error(`${key} は配列で指定してください。`);
+    }
   }
   if (runtime.config.rerunScopes?.length) {
     const invalid = runtime.config.rerunScopes.filter((scope) => !["thread", "unit"].includes(scope));
@@ -1493,7 +1558,7 @@ function applyItemFilters(runtime, definition, items) {
     const allow = new Set(runtime.config.itemIds);
     filtered = filtered.filter((item) => allow.has(item.itemId));
   }
-  if (hasTargetThreadScope(runtime.config)) {
+  if (hasThreadFilterScope(runtime.config)) {
     filtered = filtered.filter((item) => matchesTargetThreadFilter(runtime, definition.itemType, item.meta || item));
   }
   if (runtime.config.date) {
@@ -1565,7 +1630,7 @@ function matchesRerunScope(taskKey, scopes) {
 }
 
 function matchesTargetThreadFilter(runtime, itemType, meta) {
-  if (!hasTargetThreadScope(runtime.config)) {
+  if (!hasThreadFilterScope(runtime.config)) {
     return true;
   }
   if (itemType === "run") {
@@ -1636,9 +1701,9 @@ function handleScanExport(runtime) {
 
 function handleBuildThreadIndex(runtime) {
   const rawThreads = loadRawThreads(runtime.paths.extracted);
-  const threads = rawThreads.map((thread, index) => ({ itemId: `thread_${String(index + 1).padStart(6, "0")}`, sourceThreadId: thread.sourceThreadId, title: thread.title, primaryDate: thread.primaryDate, messageCount: thread.messageCount, userMessageCount: thread.userMessageCount, assistantMessageCount: thread.assistantMessageCount, generatedImageCount: thread.generatedImageCount, preview: thread.preview, sourceFile: thread.sourceFile }));
+  const threads = rawThreads.map((thread, index) => ({ itemId: `thread_${String(index + 1).padStart(6, "0")}`, sourceThreadId: thread.sourceThreadId, groupId: thread.groupId, gizmoId: thread.gizmoId, conversationTemplateId: thread.conversationTemplateId, gizmoType: thread.gizmoType, title: thread.title, primaryDate: thread.primaryDate, messageCount: thread.messageCount, userMessageCount: thread.userMessageCount, assistantMessageCount: thread.assistantMessageCount, generatedImageCount: thread.generatedImageCount, preview: thread.preview, sourceFile: thread.sourceFile }));
   const messages = rawThreads.flatMap((thread, index) => thread.messages.map((message) => ({ threadItemId: `thread_${String(index + 1).padStart(6, "0")}`, messageId: message.id, role: message.role, date: message.date })));
-  writeArtifact(runtime, "artifacts/indexes/thread-index.json", { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, threads });
+  writeArtifact(runtime, "artifacts/indexes/thread-index.json", { schemaVersion: 2, generatedAt: isoJst(), runId: runtime.config.runId, threads });
   writeArtifact(runtime, "artifacts/indexes/message-index.json", { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, messages });
   return ["artifacts/indexes/thread-index.json", "artifacts/indexes/message-index.json"];
 }
@@ -1649,7 +1714,7 @@ function handleNormalizeThreads(runtime) {
   for (const thread of loadRawThreads(runtime.paths.extracted)) {
     const itemId = indexBySource.get(thread.sourceThreadId);
     if (!itemId) continue;
-    writeArtifact(runtime, `artifacts/normalized/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, sourceThreadId: thread.sourceThreadId, title: thread.title, primaryDate: thread.primaryDate, createTime: thread.createTime, updateTime: thread.updateTime, messageCount: thread.messageCount, userMessageCount: thread.userMessageCount, assistantMessageCount: thread.assistantMessageCount, generatedImageCount: thread.generatedImageCount, preview: thread.preview, messages: thread.messages });
+    writeArtifact(runtime, `artifacts/normalized/${itemId}.json`, { schemaVersion: 2, generatedAt: isoJst(), runId: runtime.config.runId, itemId, sourceThreadId: thread.sourceThreadId, groupId: thread.groupId, gizmoId: thread.gizmoId, conversationTemplateId: thread.conversationTemplateId, gizmoType: thread.gizmoType, title: thread.title, primaryDate: thread.primaryDate, createTime: thread.createTime, updateTime: thread.updateTime, messageCount: thread.messageCount, userMessageCount: thread.userMessageCount, assistantMessageCount: thread.assistantMessageCount, generatedImageCount: thread.generatedImageCount, preview: thread.preview, messages: thread.messages });
     artifactPaths.push(`artifacts/normalized/${itemId}.json`);
   }
   return artifactPaths;
@@ -1715,9 +1780,9 @@ async function handleSummarizeTurn(runtime, itemId, meta) {
     userIntent: response.parsed.userIntent || "",
     assistantResponse: response.parsed.assistantResponse || "",
     outcome: response.parsed.outcome || "",
-    aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit }
+    aiMeta: buildAiMeta(runtime, meta, response)
   });
-  writeRaw(runtime, "ai.summarize_turn", itemId, response.text);
+  writeRaw(runtime, "ai.summarize_turn", itemId, response.text, response.usage);
   return [`artifacts/ai/turn_summaries/${itemId}.json`, `artifacts/raw/ai.summarize_turn/${itemId}.raw.json`];
 }
 
@@ -1751,9 +1816,9 @@ async function handleClassifyTurn(runtime, itemId, meta) {
     secondaryCategoryLabels: secondaryCategories.map((categoryId) => categoryLabels.get(categoryId) || categoryId),
     reason: response.parsed.reason || "",
     proposedCategories: Array.isArray(response.parsed.proposedCategories) ? response.parsed.proposedCategories : [],
-    aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit, categoryMasterUpdated: masterUpdated }
+    aiMeta: buildAiMeta(runtime, meta, response, { categoryMasterUpdated: masterUpdated })
   });
-  writeRaw(runtime, "ai.classify_turn", itemId, response.text);
+  writeRaw(runtime, "ai.classify_turn", itemId, response.text, response.usage);
   return artifactPaths;
 }
 
@@ -1794,7 +1859,7 @@ async function handleMergeThreadTurns(runtime, itemId, meta) {
     secondary: secondaryCategories,
     reason: response.parsed.reason || mergedClassification.reason || "",
     proposedCategories: [],
-    aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit, classificationMergedInCode: true }
+    aiMeta: buildAiMeta(runtime, meta, response, { classificationMergedInCode: true })
   });
   writeArtifact(runtime, `artifacts/ai/thread_findings/${itemId}.json`, {
     schemaVersion: 1,
@@ -1806,7 +1871,7 @@ async function handleMergeThreadTurns(runtime, itemId, meta) {
     outcomes: Array.isArray(response.parsed.outcomes) ? response.parsed.outcomes : [],
     images: Array.isArray(response.parsed.images) ? response.parsed.images : [],
     narrative: response.parsed.narrative || "",
-    aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit }
+    aiMeta: buildAiMeta(runtime, meta, response)
   });
   writeArtifact(runtime, `artifacts/ai/thread_summaries/${itemId}.json`, {
     schemaVersion: 1,
@@ -1815,9 +1880,9 @@ async function handleMergeThreadTurns(runtime, itemId, meta) {
     itemId,
     summaryTitle: response.parsed.summaryTitle || "",
     narrative: response.parsed.narrative || "",
-    aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit }
+    aiMeta: buildAiMeta(runtime, meta, response)
   });
-  writeRaw(runtime, "ai.merge_thread_turns", itemId, response.text);
+  writeRaw(runtime, "ai.merge_thread_turns", itemId, response.text, response.usage);
   return artifactPaths;
 }
 
@@ -1871,17 +1936,17 @@ async function handleClassifyThread(runtime, itemId, meta) {
     secondary: secondaryCategories,
     reason: response.parsed.reason || "",
     proposedCategories: Array.isArray(response.parsed.proposedCategories) ? response.parsed.proposedCategories : [],
-    aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit, adaptiveSplit: response.adaptiveSplit, chunkCount: response.chunkCount, categoryMasterUpdated: masterUpdated }
+    aiMeta: buildAiMeta(runtime, meta, response, { adaptiveSplit: response.adaptiveSplit, chunkCount: response.chunkCount, categoryMasterUpdated: masterUpdated })
   });
-  writeRaw(runtime, "ai.classify_thread", itemId, response.text);
+  writeRaw(runtime, "ai.classify_thread", itemId, response.text, response.usage);
   return artifactPaths;
 }
 
 async function handleExtractFindings(runtime, itemId, meta) {
   const thread = readArtifact(runtime, `artifacts/normalized/${itemId}.json`);
   const response = await askForAdaptiveThreadJson(runtime, { taskKey: "ai.extract_findings", itemId, name: `findings-${itemId}`, model: meta.model, thread, baseInput: { threadId: itemId }, buildPrompt: (payload) => buildExtractFindingsPrompt(payload), mergeParsed: mergeFindingsResults });
-  writeArtifact(runtime, `artifacts/ai/thread_findings/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, interests: Array.isArray(response.parsed.interests) ? response.parsed.interests : [], questions: Array.isArray(response.parsed.questions) ? response.parsed.questions : [], outcomes: Array.isArray(response.parsed.outcomes) ? response.parsed.outcomes : [], images: Array.isArray(response.parsed.images) ? response.parsed.images : [], narrative: response.parsed.narrative || "", aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit, adaptiveSplit: response.adaptiveSplit, chunkCount: response.chunkCount } });
-  writeRaw(runtime, "ai.extract_findings", itemId, response.text);
+  writeArtifact(runtime, `artifacts/ai/thread_findings/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, interests: Array.isArray(response.parsed.interests) ? response.parsed.interests : [], questions: Array.isArray(response.parsed.questions) ? response.parsed.questions : [], outcomes: Array.isArray(response.parsed.outcomes) ? response.parsed.outcomes : [], images: Array.isArray(response.parsed.images) ? response.parsed.images : [], narrative: response.parsed.narrative || "", aiMeta: buildAiMeta(runtime, meta, response, { adaptiveSplit: response.adaptiveSplit, chunkCount: response.chunkCount }) });
+  writeRaw(runtime, "ai.extract_findings", itemId, response.text, response.usage);
   return [`artifacts/ai/thread_findings/${itemId}.json`, `artifacts/raw/ai.extract_findings/${itemId}.raw.json`];
 }
 
@@ -1890,24 +1955,31 @@ function handleGroupUnits(runtime) {
   const labels = new Map((readCategoryMaster(runtime)?.categories || []).map((category) => [category.id, category.label]));
   const existing = readArtifact(runtime, "artifacts/units/units.json")?.items || [];
   const allThreads = readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || [];
-  const targetThreadItemIds = new Set(runtime.config.targetThreadItemIds || []);
-  const scopedThreads = hasTargetThreadScope(runtime.config) ? allThreads.filter((thread) => threadMatchesTargetScopes(thread, runtime.config)) : allThreads;
+  const scopedThreads = hasThreadFilterScope(runtime.config) ? allThreads.filter((thread) => threadMatchesTargetScopes(thread, runtime.config)) : allThreads;
+  const affectedSourceThreads = hasTargetThreadScope(runtime.config)
+    ? allThreads.filter((thread) => threadMatchesPositiveTargetScopes(thread, runtime.config))
+    : hasThreadExcludeScope(runtime.config) && existing.length > 0
+      ? allThreads.filter((thread) => threadMatchesExcludeScopes(thread, runtime.config))
+      : scopedThreads;
   const affectedDates = runtime.config.date
     ? new Set([runtime.config.date])
-    : new Set(scopedThreads.map((thread) => thread.primaryDate || "unknown"));
+    : new Set(affectedSourceThreads.map((thread) => thread.primaryDate || "unknown"));
   const preserved = runtime.config.grouping === "category"
     ? []
     : existing.filter((unit) => !affectedDates.has(unit.date || "unknown"));
   const buckets = new Map(preserved.map((unit) => [unit.itemId, { ...unit, threadItemIds: [...(unit.threadItemIds || [])] }]));
   for (const thread of allThreads) {
     const date = thread.primaryDate || "unknown";
+    if (threadMatchesExcludeScopes(thread, runtime.config)) {
+      continue;
+    }
     if (runtime.config.grouping !== "category" && affectedDates.size > 0 && !affectedDates.has(date)) {
       continue;
     }
-    if (hasTargetThreadScope(runtime.config) && runtime.config.grouping === "category" && !threadMatchesTargetScopes(thread, runtime.config)) {
+    if (hasThreadFilterScope(runtime.config) && runtime.config.grouping === "category" && !threadMatchesTargetScopes(thread, runtime.config)) {
       continue;
     }
-    if (hasTargetThreadScope(runtime.config) && runtime.config.grouping !== "category" && !threadMatchesTargetScopes(thread, runtime.config) && !hasThreadSummaryInputs(runtime, thread.itemId)) {
+    if (hasThreadFilterScope(runtime.config) && runtime.config.grouping !== "category" && !threadMatchesTargetScopes(thread, runtime.config) && !hasThreadSummaryInputs(runtime, thread.itemId)) {
       continue;
     }
     const classification = classes.get(thread.itemId);
@@ -1925,24 +1997,24 @@ function handleGroupUnits(runtime) {
 async function handleSummarizeUnit(runtime, itemId, meta) {
   const response = await askForJson(runtime, "ai.summarize_unit", itemId, `unit-${itemId}`, meta);
   const unit = readUnit(runtime, itemId);
-  writeArtifact(runtime, `artifacts/ai/unit_summaries/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, label: unit.label, date: unit.date, category: unit.category, summaryTitle: response.parsed.summaryTitle || unit.label, interests: Array.isArray(response.parsed.interests) ? response.parsed.interests : [], questions: Array.isArray(response.parsed.questions) ? response.parsed.questions : [], outcomes: Array.isArray(response.parsed.outcomes) ? response.parsed.outcomes : [], images: Array.isArray(response.parsed.images) ? response.parsed.images : [], narrative: response.parsed.narrative || "", aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit } });
-  writeRaw(runtime, "ai.summarize_unit", itemId, response.text);
+  writeArtifact(runtime, `artifacts/ai/unit_summaries/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, label: unit.label, date: unit.date, category: unit.category, summaryTitle: response.parsed.summaryTitle || unit.label, interests: Array.isArray(response.parsed.interests) ? response.parsed.interests : [], questions: Array.isArray(response.parsed.questions) ? response.parsed.questions : [], outcomes: Array.isArray(response.parsed.outcomes) ? response.parsed.outcomes : [], images: Array.isArray(response.parsed.images) ? response.parsed.images : [], narrative: response.parsed.narrative || "", aiMeta: buildAiMeta(runtime, meta, response) });
+  writeRaw(runtime, "ai.summarize_unit", itemId, response.text, response.usage);
   return [`artifacts/ai/unit_summaries/${itemId}.json`, `artifacts/raw/ai.summarize_unit/${itemId}.raw.json`];
 }
 
 async function handleWriteEntry(runtime, itemId, meta) {
   const response = await askForJson(runtime, "ai.write_diary_entry", itemId, `entry-draft-${itemId}`, meta);
   const entry = readEntry(runtime, itemId);
-  writeArtifact(runtime, `artifacts/ai/diary_drafts/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, date: entry.date, title: response.parsed.title || `${entry.date} の日記`, lead: response.parsed.lead || "", sections: Array.isArray(response.parsed.sections) ? response.parsed.sections : [], closing: response.parsed.closing || "", images: Array.isArray(response.parsed.images) ? response.parsed.images : [], aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit } });
-  writeRaw(runtime, "ai.write_diary_entry", itemId, response.text);
+  writeArtifact(runtime, `artifacts/ai/diary_drafts/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, date: entry.date, title: response.parsed.title || `${entry.date} の日記`, lead: response.parsed.lead || "", sections: Array.isArray(response.parsed.sections) ? response.parsed.sections : [], closing: response.parsed.closing || "", images: Array.isArray(response.parsed.images) ? response.parsed.images : [], aiMeta: buildAiMeta(runtime, meta, response) });
+  writeRaw(runtime, "ai.write_diary_entry", itemId, response.text, response.usage);
   return [`artifacts/ai/diary_drafts/${itemId}.json`, `artifacts/raw/ai.write_diary_entry/${itemId}.raw.json`];
 }
 
 async function handleRewriteEntry(runtime, itemId, meta) {
   const response = await askForJson(runtime, "ai.rewrite_diary_entry", itemId, `entry-final-${itemId}`, meta);
   const draft = readArtifact(runtime, `artifacts/ai/diary_drafts/${itemId}.json`) || {};
-  writeArtifact(runtime, `artifacts/ai/diary_entries/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, date: draft.date, title: response.parsed.title || draft.title, markdownBody: response.parsed.markdownBody || draftToMarkdown(draft), images: Array.isArray(response.parsed.images) ? response.parsed.images : draft.images || [], aiMeta: { model: meta.model, think: meta.think, promptHash: meta.promptHash, inputHash: meta.inputHash, provider: aiProviderLabel(runtime), cacheHit: response.cacheHit } });
-  writeRaw(runtime, "ai.rewrite_diary_entry", itemId, response.text);
+  writeArtifact(runtime, `artifacts/ai/diary_entries/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, date: draft.date, title: response.parsed.title || draft.title, markdownBody: response.parsed.markdownBody || draftToMarkdown(draft), images: Array.isArray(response.parsed.images) ? response.parsed.images : draft.images || [], aiMeta: buildAiMeta(runtime, meta, response) });
+  writeRaw(runtime, "ai.rewrite_diary_entry", itemId, response.text, response.usage);
   return [`artifacts/ai/diary_entries/${itemId}.json`, `artifacts/raw/ai.rewrite_diary_entry/${itemId}.raw.json`];
 }
 
@@ -2004,7 +2076,9 @@ function loadRawThreads(extractDir) {
       if (!messages.length) continue;
       const startTime = messages[0].createTime || conversation.create_time || 0;
       const firstUser = messages.find((message) => message.role === "user");
-      threads.push({ sourceThreadId: conversation.conversation_id || conversation.id || `thread-${threads.length + 1}`, title: conversation.title || "Untitled", createTime: conversation.create_time || startTime, updateTime: conversation.update_time || startTime, primaryDate: dateKey(startTime), messageCount: messages.length, userMessageCount: messages.filter((message) => message.role === "user").length, assistantMessageCount: messages.filter((message) => message.role === "assistant").length, generatedImageCount: messages.reduce((sum, message) => sum + message.generatedImages.length, 0), preview: clip(firstUser?.text ?? messages[0]?.text ?? "", 300), sourceFile: path.relative(extractDir, file).replaceAll("\\", "/"), messages });
+      const gizmoId = conversation.gizmo_id || null;
+      const conversationTemplateId = conversation.conversation_template_id || null;
+      threads.push({ sourceThreadId: conversation.conversation_id || conversation.id || `thread-${threads.length + 1}`, groupId: gizmoId || conversationTemplateId, gizmoId, conversationTemplateId, gizmoType: conversation.gizmo_type || null, title: conversation.title || "Untitled", createTime: conversation.create_time || startTime, updateTime: conversation.update_time || startTime, primaryDate: dateKey(startTime), messageCount: messages.length, userMessageCount: messages.filter((message) => message.role === "user").length, assistantMessageCount: messages.filter((message) => message.role === "assistant").length, generatedImageCount: messages.reduce((sum, message) => sum + message.generatedImages.length, 0), preview: clip(firstUser?.text ?? messages[0]?.text ?? "", 300), sourceFile: path.relative(extractDir, file).replaceAll("\\", "/"), messages });
     }
   }
   return threads;
@@ -2039,10 +2113,11 @@ async function askForJson(runtime, taskKey, itemId, name, meta) {
   if (cached?.text) {
     emitEvent(runtime, { type: "task.cache_hit", stage: runtime.current.stage, taskKey, itemType: runtime.current.itemType, itemId, taskInstanceId: runtime.current.taskInstanceId, note: "AI cache を再利用しました" });
     writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: meta.promptPreview, sentAt: cached.cachedAt || null, note: "AI cache を再利用しました", lastEvent: "task.cache_hit" });
-    return { text: cached.text, parsed: cached.parsed, cacheHit: true };
+    return { text: cached.text, parsed: cached.parsed, usage: cached.usage || null, cacheHit: true };
   }
   const client = await getAppServerClient(runtime.config);
-  for (let parseAttempt = 1; parseAttempt <= 2; parseAttempt += 1) {
+  const maxParseAttempts = Number(runtime.config.jsonRetryAttempts || 2);
+  for (let parseAttempt = 1; parseAttempt <= maxParseAttempts; parseAttempt += 1) {
     const prompt = parseAttempt === 1 ? meta.prompt : buildJsonRepairPrompt(meta.prompt);
     const promptPath = path.join(dir, `${name.replace(/[^a-zA-Z0-9-_]/g, "_")}${parseAttempt > 1 ? `__retry${parseAttempt}` : ""}.prompt.txt`);
     fs.writeFileSync(promptPath, ["あなたは JSON のみを返す情報整理アシスタントです。", "前置き、説明、コードブロックは禁止です。", "コマンド実行、ファイル変更、ツール使用は禁止です。", "必ず単一の JSON オブジェクトだけを返してください。", "", prompt].join("\n"), "utf8");
@@ -2050,7 +2125,7 @@ async function askForJson(runtime, taskKey, itemId, name, meta) {
       logTextBlock("system", `${taskKey}__${itemId}${parseAttempt > 1 ? ` retry=${parseAttempt}` : ""}`, getOllamaSystemPrompt(runtime.config));
     }
     logTextBlock("prompt", `${taskKey}__${itemId}${parseAttempt > 1 ? ` retry=${parseAttempt}` : ""}`, prompt);
-    const text = await runAiWithRetry(runtime, taskKey, itemId, async () => client.runJsonTurn({
+    const aiResult = await runAiWithRetry(runtime, taskKey, itemId, async () => client.runJsonTurn({
       model: meta.model,
       think: meta.think,
       cwd: process.cwd(),
@@ -2068,13 +2143,18 @@ async function askForJson(runtime, taskKey, itemId, name, meta) {
     })).catch((error) => {
       throw normalizeAiFailure(error);
     });
+    const text = typeof aiResult === "string" ? aiResult : String(aiResult?.text || "");
+    const usage = typeof aiResult === "string" ? null : normalizeAiUsage(aiResult?.usage);
     flushResponseDeltaConsole(taskKey, itemId);
     logTextBlock("response", `${taskKey}__${itemId}${parseAttempt > 1 ? ` retry=${parseAttempt}` : ""}`, text);
-    writeRaw(runtime, taskKey, itemId, text);
+    writeRaw(runtime, taskKey, itemId, text, usage);
     const parsedResult = parseAiJsonResponse(text);
     if (parsedResult.parsed) {
-      writeJson(cachePath, { schemaVersion: 1, cachedAt: isoJst(), taskKey, itemId, model: meta.model, think: meta.think, inputHash: meta.inputHash, promptHash: meta.promptHash, text, parsed: parsedResult.parsed });
-      return { text, parsed: parsedResult.parsed, cacheHit: false };
+      if (usage) {
+        emitEvent(runtime, { type: "task.ai_usage", stage: runtime.current.stage, taskKey, itemType: runtime.current.itemType, itemId, taskInstanceId: runtime.current.taskInstanceId, usage });
+      }
+      writeJson(cachePath, { schemaVersion: 1, cachedAt: isoJst(), taskKey, itemId, model: meta.model, think: meta.think, inputHash: meta.inputHash, promptHash: meta.promptHash, text, parsed: parsedResult.parsed, usage });
+      return { text, parsed: parsedResult.parsed, usage, cacheHit: false };
     }
     writeParseError(runtime, taskKey, itemId, {
       parseAttempt,
@@ -2082,11 +2162,12 @@ async function askForJson(runtime, taskKey, itemId, name, meta) {
       think: meta.think,
       promptHash: meta.promptHash,
       inputHash: meta.inputHash,
+      usage,
       ...parsedResult
     });
     emitEvent(runtime, { type: "task.json_parse_error", stage: runtime.current.stage, taskKey, itemType: runtime.current.itemType, itemId, taskInstanceId: runtime.current.taskInstanceId, note: `JSON 解析に失敗しました (attempt=${parseAttempt})` });
-    if (parseAttempt < 2) {
-      const note = `JSON 形式エラーのため、より厳しい JSON 指示で再実行します (${parseAttempt}/2)`;
+    if (parseAttempt < maxParseAttempts) {
+      const note = `JSON 形式エラーのため、より厳しい JSON 指示で再実行します (${parseAttempt}/${maxParseAttempts})`;
       emitEvent(runtime, { type: "task.retry_scheduled", stage: runtime.current.stage, taskKey, itemType: runtime.current.itemType, itemId, taskInstanceId: runtime.current.taskInstanceId, note });
       writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: runtime.current.promptPreview, sentAt: runtime.current.sentAt, note, lastEvent: "task.retry_scheduled" });
       continue;
@@ -2104,11 +2185,12 @@ async function runAiWithRetry(runtime, taskKey, itemId, run) {
   let lastError = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      const text = await run();
+      const result = await run();
+      const text = typeof result === "string" ? result : String(result?.text || "");
       if (isRetryableAiText(text)) {
         throw new Error(text.trim());
       }
-      return text;
+      return result;
     } catch (error) {
       lastError = error;
       if (!isRetryableAiFailure(error) || attempt === maxAttempts) {
@@ -2243,15 +2325,31 @@ function repairJsonText(text) {
 
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index];
-      if (inString) {
-        if (!escaped && char === "\r") {
+    if (inString) {
+      if (!escaped) {
+        if (char === "\r") {
           continue;
         }
-        if (!escaped && char === "\n") {
+        if (char === "\n") {
           result += "\\n";
           continue;
         }
-        if (!escaped && char === "\"") {
+        if (char === "\t") {
+          result += "\\t";
+          continue;
+        }
+        if (char === "\b") {
+          result += "\\b";
+          continue;
+        }
+        if (char === "\f") {
+          result += "\\f";
+          continue;
+        }
+        if (isIllegalJsonControlChar(char)) {
+          continue;
+        }
+        if (char === "\"") {
           if (isLikelyStringTerminator(text, index)) {
             result += char;
             inString = false;
@@ -2260,21 +2358,25 @@ function repairJsonText(text) {
           result += "\\\"";
           continue;
         }
-        result += char;
-        if (escaped) {
-          escaped = false;
-          continue;
-        }
-        if (char === "\\") {
-          escaped = true;
-          continue;
-        }
+      }
+      result += char;
+      if (escaped) {
+        escaped = false;
         continue;
       }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      continue;
+    }
 
     if (char === "\"") {
       inString = true;
       result += char;
+      continue;
+    }
+    if (isIllegalJsonControlChar(char)) {
       continue;
     }
     if (char === "(" || char === ")") {
@@ -2297,6 +2399,11 @@ function isLikelyStringTerminator(text, index) {
   return true;
 }
 
+function isIllegalJsonControlChar(char) {
+  const code = String(char || "").charCodeAt(0);
+  return Number.isFinite(code) && code >= 0x00 && code <= 0x1f && char !== "\r" && char !== "\n" && char !== "\t" && char !== "\b" && char !== "\f";
+}
+
 function repairMalformedKeywordsField(text) {
   let repaired = String(text);
   repaired = repaired.replace(/"keywords"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"/g, (_match, a, b, c, d) => `"keywords":["${a}","${b}","${c}","${d}"]`);
@@ -2313,7 +2420,18 @@ function normalizeQuestionStatus(status) { return ["resolved", "partially_resolv
 function compareQuestionStatus(left, right) { const rank = { unresolved: 0, partially_resolved: 1, resolved: 2 }; return (rank[normalizeQuestionStatus(left)] || 0) - (rank[normalizeQuestionStatus(right)] || 0); }
 function readArtifact(runtime, relativePath) { return readJson(path.join(runtime.paths.root, relativePath)); }
 function writeArtifact(runtime, relativePath, value) { writeJson(path.join(runtime.paths.root, relativePath), value); }
-function writeRaw(runtime, taskKey, itemId, text) { writeArtifact(runtime, `artifacts/raw/${taskKey}/${itemId}.raw.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, taskKey, itemId, rawText: text }); }
+function writeRaw(runtime, taskKey, itemId, text, usage = null) {
+  const normalizedUsage = normalizeAiUsage(usage);
+  writeArtifact(runtime, `artifacts/raw/${taskKey}/${itemId}.raw.json`, {
+    schemaVersion: 1,
+    generatedAt: isoJst(),
+    runId: runtime.config.runId,
+    taskKey,
+    itemId,
+    rawText: text,
+    ...(normalizedUsage ? { usage: normalizedUsage } : {})
+  });
+}
 function writeParseError(runtime, taskKey, itemId, value) { writeArtifact(runtime, `artifacts/raw/${taskKey}/${itemId}.parse-error.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, taskKey, itemId, ...value }); }
 function readUnit(runtime, itemId) { const item = (readArtifact(runtime, "artifacts/units/units.json")?.items || []).find((candidate) => candidate.itemId === itemId); if (!item) throw new Error(`unit が見つかりません: ${itemId}`); return item; }
 function readEntry(runtime, itemId) { const units = (readArtifact(runtime, "artifacts/units/units.json")?.items || []).filter((unit) => unit.entryId === itemId); if (!units.length) throw new Error(`entry が見つかりません: ${itemId}`); return { itemId, date: units[0].date || itemId.replace(/^entry_/, ""), units, unitSummaries: units.map((unit) => readArtifact(runtime, `artifacts/ai/unit_summaries/${unit.itemId}.json`)).filter(Boolean) }; }
@@ -2321,14 +2439,14 @@ function readTurn(runtime, itemId) { const item = readArtifact(runtime, `artifac
 function loadThreads(runtime) { return (readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || []).map((thread) => readArtifact(runtime, `artifacts/normalized/${thread.itemId}.json`)).filter(Boolean); }
 function loadScopedThreads(runtime) {
   const threads = loadThreads(runtime);
-  if (!hasTargetThreadScope(runtime.config)) {
+  if (!hasThreadFilterScope(runtime.config)) {
     return threads;
   }
   return threads.filter((thread) => threadMatchesTargetScopes(thread, runtime.config));
 }
 function loadScopedThreadIndex(runtime) {
   const threads = readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || [];
-  if (!hasTargetThreadScope(runtime.config)) {
+  if (!hasThreadFilterScope(runtime.config)) {
     return threads;
   }
   return threads.filter((thread) => threadMatchesTargetScopes(thread, runtime.config));
@@ -2344,10 +2462,13 @@ function hasThreadSummaryInputs(runtime, threadItemId) {
 function loadClassifications(runtime) { return new Map((readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || []).map((thread) => [thread.itemId, readArtifact(runtime, `artifacts/ai/thread_classification/${thread.itemId}.json`)]).filter(([, value]) => value)); }
 function loadScopedClassifications(runtime) {
   const entries = [...loadClassifications(runtime).entries()];
-  if (!hasTargetThreadScope(runtime.config)) {
+  if (!hasThreadFilterScope(runtime.config)) {
     return new Map(entries);
   }
   return new Map(entries.filter(([threadItemId]) => threadItemMatchesTargetScopes(runtime, threadItemId)));
+}
+function hasThreadFilterScope(config) {
+  return hasTargetThreadScope(config) || hasThreadExcludeScope(config);
 }
 function hasTargetThreadScope(config) {
   return Boolean(
@@ -2358,11 +2479,27 @@ function hasTargetThreadScope(config) {
     || config?.targetYears?.length
   );
 }
+function hasThreadExcludeScope(config) {
+  return Boolean(
+    config?.excludeThreadItemIds?.length
+    || config?.excludeSourceThreadIds?.length
+    || config?.excludeGroupIds?.length
+  );
+}
 function threadItemMatchesTargetScopes(runtime, threadItemId) {
   const thread = (readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || []).find((candidate) => candidate.itemId === threadItemId);
   return threadMatchesTargetScopes(thread, runtime.config);
 }
 function threadMatchesTargetScopes(thread, config) {
+  if (!thread) {
+    return false;
+  }
+  if (threadMatchesExcludeScopes(thread, config)) {
+    return false;
+  }
+  return threadMatchesPositiveTargetScopes(thread, config);
+}
+function threadMatchesPositiveTargetScopes(thread, config) {
   if (!thread) {
     return false;
   }
@@ -2388,6 +2525,27 @@ function threadMatchesTargetScopes(thread, config) {
     return false;
   }
   return true;
+}
+function threadMatchesExcludeScopes(thread, config) {
+  if (!thread) {
+    return false;
+  }
+  const excludedThreadItemIds = new Set(config?.excludeThreadItemIds || []);
+  if (excludedThreadItemIds.has(thread.itemId)) {
+    return true;
+  }
+  const excludedSourceThreadIds = new Set(config?.excludeSourceThreadIds || []);
+  if (excludedSourceThreadIds.has(thread.sourceThreadId)) {
+    return true;
+  }
+  const excludedGroupIds = new Set(config?.excludeGroupIds || []);
+  if (excludedGroupIds.size > 0) {
+    const groupIds = [thread.groupId, thread.gizmoId, thread.conversationTemplateId].filter(Boolean);
+    if (groupIds.some((groupId) => excludedGroupIds.has(groupId))) {
+      return true;
+    }
+  }
+  return false;
 }
 function monthWeekKey(date) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date || ""))) {
@@ -3246,31 +3404,64 @@ class OllamaClient {
     onProgress?.({ phase: "turn-start", promptPreview: preview, sentAt, note: "Ollama にプロンプト送信中" });
     this.log({ phase: "request", model: finalModel, cwd, promptPreview: preview, think: typeof body.think === "boolean" ? body.think : null });
 
-    const response = await fetch(`${this.baseUrl}/api/generate`, {
+    const url = `${this.baseUrl}/api/generate`;
+    const timeoutMs = Number(this.ollama.requestTimeoutMs || 0);
+    const headersTimeoutMs = Number(this.ollama.headersTimeoutMs || 0);
+    const bodyTimeoutMs = Number(this.ollama.bodyTimeoutMs || 0);
+    const fetchOptions = {
       method: "POST",
       headers: {
         "content-type": "application/json",
         ...normalizeHeaders(this.ollama.headers)
       },
       body: JSON.stringify(body)
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      this.log({ phase: "response", status: response.status, ok: response.ok, preview: clip(text, 500) });
-      throw new Error(extractOllamaErrorMessage(response.status, text));
+    };
+    if (timeoutMs > 0 && typeof AbortSignal?.timeout === "function") {
+      fetchOptions.signal = AbortSignal.timeout(timeoutMs);
     }
-    onProgress?.({ phase: "waiting", promptPreview: preview, sentAt, note: "Ollama 応答を待機中" });
-    const streamed = await readOllamaStream(response, { preview, sentAt, onProgress, log: (entry) => this.log(entry) });
-    const output = streamed.output;
-    const thinkingText = streamed.thinking;
-    if (!output) {
-      throw new Error("Ollama から最終応答を取得できませんでした。");
+
+    let output = "";
+    let usage = null;
+    try {
+      const response = await requestOllamaStream(url, {
+        method: fetchOptions.method,
+        headers: fetchOptions.headers,
+        body: fetchOptions.body,
+        signal: fetchOptions.signal,
+        headersTimeoutMs,
+        bodyTimeoutMs
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        this.log({ phase: "response", status: response.status, ok: response.ok, preview: clip(text, 500) });
+        throw new Error(extractOllamaErrorMessage(response.status, text));
+      }
+      onProgress?.({ phase: "waiting", promptPreview: preview, sentAt, note: "Ollama 応答を待機中" });
+      const streamed = await readOllamaStream(response, { preview, sentAt, onProgress, log: (entry) => this.log(entry) });
+      output = streamed.output;
+      usage = streamed.usage;
+      const thinkingText = streamed.thinking;
+      if (!output) {
+        throw new Error("Ollama から最終応答を取得できませんでした。");
+      }
+    } catch (error) {
+      const normalizedError = normalizeOllamaFetchError(error, { url, model: finalModel, timeoutMs, headersTimeoutMs, bodyTimeoutMs });
+      this.log({
+        phase: "transport-error",
+        model: finalModel,
+        url,
+        timeoutMs: timeoutMs || null,
+        headersTimeoutMs: headersTimeoutMs || null,
+        bodyTimeoutMs: bodyTimeoutMs || null,
+        error: String(normalizedError.message || normalizedError)
+      });
+      throw normalizedError;
     }
 
     onProgress?.({ phase: "done", promptPreview: preview, sentAt, note: "最終応答の取得完了" });
     this.activeModel = finalModel;
-    return output;
+    return { text: output, usage };
   }
 
   async close() {}
@@ -3357,6 +3548,140 @@ function extractOllamaErrorMessage(status, text) {
   return `Ollama error (${status}): ${clip(text || "unknown error", 400)}`;
 }
 
+async function requestOllamaStream(url, options = {}) {
+  const target = new URL(url);
+  const transport = target.protocol === "https:" ? https : http;
+  const headers = options.headers || {};
+  const headersTimeoutMs = Number(options.headersTimeoutMs || 0);
+  const bodyTimeoutMs = Number(options.bodyTimeoutMs || 0);
+
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    let headersTimer = null;
+    const request = transport.request(target, {
+      method: options.method || "POST",
+      headers
+    });
+
+    const cleanup = () => {
+      if (headersTimer) {
+        clearTimeout(headersTimer);
+        headersTimer = null;
+      }
+      if (options.signal && abortHandler) {
+        options.signal.removeEventListener("abort", abortHandler);
+      }
+    };
+
+    const fail = (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+
+    const succeed = (response) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(response);
+    };
+
+    const abortHandler = () => {
+      const abortError = new Error("The operation was aborted due to timeout");
+      abortError.name = "TimeoutError";
+      request.destroy(abortError);
+      fail(abortError);
+    };
+
+    if (options.signal) {
+      if (options.signal.aborted) {
+        abortHandler();
+        return;
+      }
+      options.signal.addEventListener("abort", abortHandler, { once: true });
+    }
+
+    if (headersTimeoutMs > 0) {
+      headersTimer = setTimeout(() => {
+        const timeoutError = new Error("Headers Timeout Error");
+        timeoutError.code = "UND_ERR_HEADERS_TIMEOUT";
+        request.destroy(timeoutError);
+        fail(timeoutError);
+      }, headersTimeoutMs);
+    }
+
+    request.on("response", (incoming) => {
+      if (bodyTimeoutMs > 0) {
+        incoming.setTimeout(bodyTimeoutMs, () => {
+          const timeoutError = new Error("Body Timeout Error");
+          timeoutError.code = "UND_ERR_BODY_TIMEOUT";
+          incoming.destroy(timeoutError);
+        });
+      }
+      const response = new Response(Readable.toWeb(incoming), {
+        status: incoming.statusCode || 0,
+        statusText: incoming.statusMessage || "",
+        headers: incoming.headers
+      });
+      succeed(response);
+    });
+
+    request.on("error", (error) => {
+      fail(error);
+    });
+
+    if (options.body) {
+      request.write(options.body);
+    }
+    request.end();
+  });
+}
+
+function normalizeOllamaFetchError(error, context = {}) {
+  if (error instanceof Error && /^Ollama error \(\d+\):/i.test(error.message)) {
+    return error;
+  }
+  const cause = error && typeof error === "object" ? error.cause : null;
+  const timeoutMs = Number(context.timeoutMs || 0);
+  const headersTimeoutMs = Number(context.headersTimeoutMs || 0);
+  const bodyTimeoutMs = Number(context.bodyTimeoutMs || 0);
+  const url = context.url || "Ollama";
+  const model = context.model ? ` model=${context.model}` : "";
+  const causeCode = cause && typeof cause === "object" && "code" in cause ? String(cause.code || "").trim() : "";
+  const causeMessage = cause instanceof Error ? cause.message : (cause && typeof cause === "object" && "message" in cause ? String(cause.message || "") : "");
+  const rawMessage = error instanceof Error ? error.message : String(error || "");
+  const detail = [causeCode, causeMessage, rawMessage]
+    .map((value) => String(value || "").trim())
+    .filter((value, index, values) => value && values.indexOf(value) === index && value.toLowerCase() !== "fetch failed")
+    .join(" / ");
+
+  if (isOllamaTimeoutFailure({ rawMessage, causeCode, causeMessage, errorName: error?.name, causeName: cause?.name, detail })) {
+    const timeoutParts = [
+      timeoutMs > 0 ? `timeout=${timeoutMs}ms` : "",
+      headersTimeoutMs > 0 ? `headersTimeout=${headersTimeoutMs}ms` : "",
+      bodyTimeoutMs > 0 ? `bodyTimeout=${bodyTimeoutMs}ms` : ""
+    ].filter(Boolean).join(" ");
+    return new Error(`Ollama 応答がタイムアウトしました: ${url}${model}${timeoutParts ? ` ${timeoutParts}` : ""}${detail ? ` (${detail})` : ""}`);
+  }
+  if (/fetch failed/i.test(rawMessage) || /ECONNREFUSED|ECONNRESET|EPIPE|ETIMEDOUT|UND_ERR_/i.test(detail)) {
+    return new Error(`Ollama への接続に失敗しました: ${url}${model}${detail ? ` (${detail})` : ""}`);
+  }
+  return error instanceof Error ? error : new Error(rawMessage || "Ollama への接続に失敗しました。");
+}
+
+function isOllamaTimeoutFailure({ rawMessage, causeCode, causeMessage, errorName, causeName, detail }) {
+  const text = [rawMessage, causeCode, causeMessage, errorName, causeName, detail]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .join(" / ");
+  return /The operation was aborted due to timeout|TimeoutError|UND_ERR_HEADERS_TIMEOUT|Headers Timeout Error|UND_ERR_BODY_TIMEOUT|Body Timeout Error|ETIMEDOUT/i.test(text);
+}
+
 function parseOllamaPsModels(text) {
   return String(text || "")
     .split(/\r?\n/)
@@ -3379,6 +3704,7 @@ async function readOllamaStream(response, context) {
   let sawDone = false;
   let responseLineBuffer = "";
   let recentResponseLines = [];
+  let usage = null;
 
   while (true) {
     const { value, done } = await reader.read();
@@ -3390,10 +3716,11 @@ async function readOllamaStream(response, context) {
     while (newlineIndex >= 0) {
       const line = buffer.slice(0, newlineIndex).trim();
       buffer = buffer.slice(newlineIndex + 1);
-      if (line) {
-        const chunk = parseOllamaStreamChunk(line);
-        sawDone ||= Boolean(chunk.done);
-        const thinkingChunk = typeof chunk.thinking === "string"
+        if (line) {
+          const chunk = parseOllamaStreamChunk(line);
+          sawDone ||= Boolean(chunk.done);
+          usage = extractOllamaUsage(chunk) || usage;
+          const thinkingChunk = typeof chunk.thinking === "string"
           ? chunk.thinking
           : typeof chunk.message?.thinking === "string"
             ? chunk.message.thinking
@@ -3435,6 +3762,7 @@ async function readOllamaStream(response, context) {
   if (tail) {
     const chunk = parseOllamaStreamChunk(tail);
     sawDone ||= Boolean(chunk.done);
+    usage = extractOllamaUsage(chunk) || usage;
     const thinkingChunk = typeof chunk.thinking === "string"
       ? chunk.thinking
       : typeof chunk.message?.thinking === "string"
@@ -3470,11 +3798,43 @@ async function readOllamaStream(response, context) {
     }
   }
 
-  context.log({ phase: "response", ok: true, done: sawDone, preview: clip(output, 500) });
+  context.log({ phase: "response", ok: true, done: sawDone, preview: clip(output, 500), usage });
   if (thinking) {
     context.log({ phase: "thinking", preview: clip(thinking, 500) });
   }
-  return { output, thinking, done: sawDone };
+  return { output, thinking, done: sawDone, usage };
+}
+
+function extractOllamaUsage(chunk) {
+  if (!chunk || typeof chunk !== "object") {
+    return null;
+  }
+  const inputTokens = toFiniteNumber(chunk.prompt_eval_count);
+  const outputTokens = toFiniteNumber(chunk.eval_count);
+  const usage = {
+    ...(inputTokens !== null ? { inputTokens } : {}),
+    ...(outputTokens !== null ? { outputTokens } : {}),
+    ...(inputTokens !== null || outputTokens !== null ? { totalTokens: (inputTokens || 0) + (outputTokens || 0) } : {}),
+    ...durationNsToMsField("totalDurationMs", chunk.total_duration),
+    ...durationNsToMsField("loadDurationMs", chunk.load_duration),
+    ...durationNsToMsField("promptEvalDurationMs", chunk.prompt_eval_duration),
+    ...durationNsToMsField("evalDurationMs", chunk.eval_duration)
+  };
+  const promptEvalCount = toFiniteNumber(chunk.prompt_eval_count);
+  const evalCount = toFiniteNumber(chunk.eval_count);
+  if (promptEvalCount !== null) usage.promptEvalCount = promptEvalCount;
+  if (evalCount !== null) usage.evalCount = evalCount;
+  return Object.keys(usage).length ? usage : null;
+}
+
+function durationNsToMsField(key, value) {
+  const number = toFiniteNumber(value);
+  return number === null ? {} : { [key]: Math.round(number / 1000000) };
+}
+
+function toFiniteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 function detectRepeatedResponseLine(chunk, state) {

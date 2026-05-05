@@ -8,7 +8,10 @@
     "ollama": {
       "baseUrl": "http://127.0.0.1:11434",
       "keepAlive": "5m",
-      "think": false
+      "think": false,
+      "requestTimeoutMs": 3600000,
+      "headersTimeoutMs": 900000,
+      "bodyTimeoutMs": 3600000
     }
   },
   "model": "gemma4:26b",
@@ -33,6 +36,7 @@
   "maxCategories": 12,
   "categoriesPerMessage": 2,
   "summaryLanguage": "ja",
+  "jsonRetryAttempts": 4,
   "freezeCategories": false,
   "force": false
 }

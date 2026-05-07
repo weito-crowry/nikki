@@ -108,8 +108,9 @@ function createRuntime(config) {
     planned: new Set(),
     changed: new Set(),
     invalidated: new Set(),
+    taskDurations: { started: new Map(), completedMsByTaskKey: new Map() },
     counts: { total: 0, pending: 0, running: 0, completed: 0, failed: 0, skipped: 0 },
-    current: { stage: null, taskKey: null, itemType: null, itemId: null, taskInstanceId: null, promptPreview: null, sentAt: null, lastEvent: null, note: null },
+    current: { stage: null, taskKey: null, itemType: null, itemId: null, itemMeta: null, taskInstanceId: null, promptPreview: null, sentAt: null, lastEvent: null, note: null },
     lock: null,
     stopRequested: false,
     stopReason: null
@@ -315,9 +316,24 @@ function registerPlanned(runtime, definition, items) {
   return filteredItems;
 }
 
+function recordTaskDuration(runtime, taskKey, instanceId) {
+  const startedAt = runtime.taskDurations.started.get(instanceId);
+  runtime.taskDurations.started.delete(instanceId);
+  if (!startedAt) {
+    return;
+  }
+  const durationMs = Math.max(0, Date.now() - startedAt);
+  const values = runtime.taskDurations.completedMsByTaskKey.get(taskKey) || [];
+  values.push(durationMs);
+  if (values.length > 200) {
+    values.splice(0, values.length - 200);
+  }
+  runtime.taskDurations.completedMsByTaskKey.set(taskKey, values);
+}
+
 async function executeTask(runtime, definition, item) {
   const instanceId = taskInstanceId(definition.taskKey, item.itemId);
-  runtime.current = { stage: definition.stage, taskKey: definition.taskKey, itemType: definition.itemType, itemId: item.itemId, taskInstanceId: instanceId, promptPreview: null, sentAt: null, lastEvent: null, note: null };
+  runtime.current = { stage: definition.stage, taskKey: definition.taskKey, itemType: definition.itemType, itemId: item.itemId, itemMeta: item.meta || null, taskInstanceId: instanceId, promptPreview: null, sentAt: null, lastEvent: null, note: null };
   const meta = await buildTaskMeta(runtime, definition, item);
   const dependsOn = resolveDependsOn(runtime, definition.taskKey, item.itemId);
   let state = readState(runtime, definition.taskKey, item.itemId);
@@ -348,6 +364,7 @@ async function executeTask(runtime, definition, item) {
   logConsole("run ", instanceId);
   runtime.counts.running += 1;
   runtime.counts.pending = Math.max(runtime.counts.total - runtime.counts.completed - runtime.counts.failed - runtime.counts.skipped - runtime.counts.running, 0);
+  runtime.taskDurations.started.set(instanceId, Date.now());
   emitEvent(runtime, { type: "task.started", stage: definition.stage, taskKey: definition.taskKey, itemType: definition.itemType, itemId: item.itemId, taskInstanceId: instanceId, note: "task を開始しました" });
   writeState(runtime, definition, item.itemId, { status: "running", dependsOn, inputHash: meta.inputHash, promptHash: meta.promptHash, model: meta.model, artifactPaths: state?.artifactPaths || [], startedAt: isoJst(), finishedAt: null, retryCount: Number(state?.retryCount || 0), error: null });
   writeProgress(runtime, { status: "running", stage: definition.stage, taskKey: definition.taskKey, itemType: definition.itemType, currentItemId: item.itemId, currentTaskInstanceId: instanceId, promptPreview: meta.promptPreview, note: "実行中", lastEvent: "task.started" });
@@ -358,6 +375,7 @@ async function executeTask(runtime, definition, item) {
     runtime.invalidated.delete(instanceId);
     runtime.counts.running -= 1;
     runtime.counts.completed += 1;
+    recordTaskDuration(runtime, definition.taskKey, instanceId);
     runtime.counts.pending = Math.max(runtime.counts.total - runtime.counts.completed - runtime.counts.failed - runtime.counts.skipped - runtime.counts.running, 0);
     writeState(runtime, definition, item.itemId, { status: "completed", dependsOn, inputHash: meta.inputHash, promptHash: meta.promptHash, model: meta.model, artifactPaths, startedAt: readState(runtime, definition.taskKey, item.itemId)?.startedAt || isoJst(), finishedAt: isoJst(), retryCount: Number(state?.retryCount || 0), error: null });
     emitEvent(runtime, { type: "task.completed", stage: definition.stage, taskKey: definition.taskKey, itemType: definition.itemType, itemId: item.itemId, taskInstanceId: instanceId, artifactPaths, note: "task が完了しました" });
@@ -366,6 +384,7 @@ async function executeTask(runtime, definition, item) {
   } catch (error) {
     runtime.counts.running -= 1;
     runtime.counts.failed += 1;
+    recordTaskDuration(runtime, definition.taskKey, instanceId);
     runtime.counts.pending = Math.max(runtime.counts.total - runtime.counts.completed - runtime.counts.failed - runtime.counts.skipped - runtime.counts.running, 0);
     const message = error instanceof Error ? error.message : String(error);
     writeState(runtime, definition, item.itemId, { status: "failed", dependsOn, inputHash: meta.inputHash, promptHash: meta.promptHash, model: meta.model, artifactPaths: state?.artifactPaths || [], startedAt: readState(runtime, definition.taskKey, item.itemId)?.startedAt || isoJst(), finishedAt: isoJst(), retryCount: Number(state?.retryCount || 0) + 1, error: { code: "TASK_FAILED", message, retryable: true } });
@@ -2138,6 +2157,9 @@ async function askForJson(runtime, taskKey, itemId, name, meta) {
         if (event.phase === "agent-message" && event.deltaText) {
           logResponseDeltaConsole(taskKey, itemId, event.deltaText);
         }
+        if (event.phase === "turn-start") {
+          logTaskProgressConsole(runtime);
+        }
         writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: event.promptPreview || runtime.current.promptPreview, sentAt: event.sentAt || runtime.current.sentAt, note: event.note || null, lastEvent: `ai.${event.phase || "progress"}` });
       }
     })).catch((error) => {
@@ -2169,6 +2191,7 @@ async function askForJson(runtime, taskKey, itemId, name, meta) {
     if (parseAttempt < maxParseAttempts) {
       const note = `JSON 形式エラーのため、より厳しい JSON 指示で再実行します (${parseAttempt}/${maxParseAttempts})`;
       emitEvent(runtime, { type: "task.retry_scheduled", stage: runtime.current.stage, taskKey, itemType: runtime.current.itemType, itemId, taskInstanceId: runtime.current.taskInstanceId, note });
+      logConsole("retry", runtime.current.taskInstanceId, note);
       writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: runtime.current.promptPreview, sentAt: runtime.current.sentAt, note, lastEvent: "task.retry_scheduled" });
       continue;
     }
@@ -2199,6 +2222,7 @@ async function runAiWithRetry(runtime, taskKey, itemId, run) {
       const delayMs = Math.min(1000 * (2 ** (attempt - 1)), 30000);
       const note = `一時的な AI エラーのため ${delayMs}ms 後に再試行します (${attempt}/${maxAttempts})`;
       emitEvent(runtime, { type: "task.retry_scheduled", stage: runtime.current.stage, taskKey, itemType: runtime.current.itemType, itemId, taskInstanceId: runtime.current.taskInstanceId, note });
+      logConsole("retry", runtime.current.taskInstanceId, note);
       writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: runtime.current.promptPreview, sentAt: runtime.current.sentAt, note, lastEvent: "task.retry_scheduled" });
       await sleep(delayMs);
     }
@@ -2836,6 +2860,101 @@ function wrapBlogPostHtml(post, entry, posts) {
 function emitEvent(runtime, payload) { fs.appendFileSync(runtime.paths.events, `${JSON.stringify({ at: isoJst(), runId: runtime.config.runId, ...payload })}\n`, "utf8"); runtime.current.lastEvent = payload.type || null; runtime.current.note = payload.note || null; }
 function writeProgress(runtime, override = {}) { const started = new Date(runtime.startedAt); writeJson(runtime.paths.progress, { schemaVersion: 1, runId: runtime.config.runId, status: override.status ?? "running", stage: override.stage ?? runtime.current.stage, taskKey: override.taskKey ?? runtime.current.taskKey, itemType: override.itemType ?? runtime.current.itemType, currentItemId: override.currentItemId ?? runtime.current.itemId, currentTaskInstanceId: override.currentTaskInstanceId ?? runtime.current.taskInstanceId, counts: { ...runtime.counts }, startedAt: runtime.startedAt, updatedAt: isoJst(), elapsedSec: Number.isNaN(started.getTime()) ? 0 : Math.max(Math.floor((Date.now() - started.getTime()) / 1000), 0), lastEvent: override.lastEvent ?? runtime.current.lastEvent, promptPreview: override.promptPreview ?? runtime.current.promptPreview, sentAt: override.sentAt ?? runtime.current.sentAt, note: override.note ?? runtime.current.note }); }
 function logConsole(label, target, note = "") { ensureStreamConsoleClosed(); const suffix = note ? ` ${note}` : ""; console.log(`${consoleTime()} [${label}] ${target}${suffix}`); }
+function logTaskProgressConsole(runtime) {
+  ensureStreamConsoleClosed();
+  const taskDone = runtime.counts.completed + runtime.counts.skipped + runtime.counts.failed + runtime.counts.running;
+  const taskTotal = runtime.counts.total || 0;
+  const taskText = `tasks ${taskDone}/${taskTotal} ${progressBar(taskDone, taskTotal)}`;
+  const thread = currentThreadProgress(runtime);
+  const threadText = thread
+    ? `threads ${thread.current}/${thread.total} ${progressBar(thread.current, thread.total)} current=${thread.itemId}${thread.title ? ` ${clip(thread.title, 48)}` : ""}`
+    : "threads -";
+  const eta = currentTaskEta(runtime);
+  const etaText = eta
+    ? `avg=${formatDuration(eta.averageMs)} eta=${formatDuration(eta.remainingMs)} finish=${formatClockTime(new Date(Date.now() + eta.remainingMs))} samples=${eta.samples}`
+    : "avg=- eta=-";
+  logConsole("progress", runtime.current.taskInstanceId || "run", `${taskText} ${threadText} ${etaText}`);
+}
+function currentTaskEta(runtime) {
+  const taskKey = runtime.current.taskKey;
+  if (!taskKey) {
+    return null;
+  }
+  const samples = runtime.taskDurations.completedMsByTaskKey.get(taskKey) || [];
+  if (!samples.length) {
+    return null;
+  }
+  const averageMs = Math.round(samples.reduce((sum, value) => sum + value, 0) / samples.length);
+  const remaining = plannedRemainingForTaskKey(runtime, taskKey);
+  return { averageMs, remainingMs: averageMs * remaining, remaining, samples: samples.length };
+}
+function plannedRemainingForTaskKey(runtime, taskKey) {
+  let remaining = 0;
+  const prefix = `${taskKey}__`;
+  for (const instanceId of runtime.planned) {
+    if (!instanceId.startsWith(prefix)) {
+      continue;
+    }
+    const state = readStateByInstanceId(runtime, instanceId);
+    if (!["completed", "skipped"].includes(state?.status)) {
+      remaining += 1;
+    }
+  }
+  return remaining;
+}
+function readStateByInstanceId(runtime, instanceId) {
+  return readJson(path.join(runtime.paths.state, `${instanceId}.json`));
+}
+function currentThreadProgress(runtime) {
+  const currentThreadItemId = currentThreadItemIdForProgress(runtime);
+  if (!currentThreadItemId) {
+    return null;
+  }
+  const scopedThreads = loadScopedThreadIndex(runtime);
+  const allThreads = readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || [];
+  const threads = scopedThreads.length ? scopedThreads : allThreads;
+  const index = threads.findIndex((thread) => thread.itemId === currentThreadItemId);
+  const fallbackIndex = allThreads.findIndex((thread) => thread.itemId === currentThreadItemId);
+  const thread = index >= 0 ? threads[index] : allThreads[fallbackIndex];
+  const total = threads.length || allThreads.length || 0;
+  const current = index >= 0 ? index + 1 : fallbackIndex >= 0 ? fallbackIndex + 1 : 0;
+  return thread ? { itemId: thread.itemId, title: thread.title || "", current, total } : null;
+}
+function currentThreadItemIdForProgress(runtime) {
+  if (runtime.current.itemType === "thread") {
+    return runtime.current.itemId;
+  }
+  if (runtime.current.itemType === "turn") {
+    return runtime.current.itemMeta?.threadItemId || String(runtime.current.itemId || "").match(/^(thread_\d+)_turn_\d+$/)?.[1] || null;
+  }
+  const threadItemIds = runtime.current.itemMeta?.threadItemIds || [];
+  return threadItemIds.length === 1 ? threadItemIds[0] : null;
+}
+function progressBar(current, total, width = 20) {
+  if (!total || total <= 0) {
+    return "[--------------------]   0.0%";
+  }
+  const ratio = Math.max(0, Math.min(1, current / total));
+  const filled = Math.round(ratio * width);
+  return `[${"#".repeat(filled)}${"-".repeat(width - filled)}] ${(ratio * 100).toFixed(1).padStart(5, " ")}%`;
+}
+function formatDuration(ms) {
+  const totalSec = Math.max(0, Math.round(Number(ms || 0) / 1000));
+  const hours = Math.floor(totalSec / 3600);
+  const minutes = Math.floor((totalSec % 3600) / 60);
+  const seconds = totalSec % 60;
+  if (hours > 0) {
+    return `${hours}h${String(minutes).padStart(2, "0")}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m${String(seconds).padStart(2, "0")}s`;
+  }
+  return `${seconds}s`;
+}
+function formatClockTime(date) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Tokyo", hour: "2-digit", minute: "2-digit" }).formatToParts(date).map((part) => [part.type, part.value]));
+  return `${parts.hour}:${parts.minute}`;
+}
 function logTextBlock(label, target, text) {
   ensureStreamConsoleClosed();
   console.log(`${consoleTime()} [${label}] ${target}`);

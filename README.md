@@ -156,7 +156,6 @@ Ollama の例:
   },
   "model": "qwen3.5:2b",
   "taskThinks": {
-    "ai.generate_category_candidates": false,
     "ai.classify_thread": false,
     "ai.extract_findings": false,
     "ai.summarize_unit": true,
@@ -177,7 +176,7 @@ Ollama の例:
 3. `prepare.build_thread_index`
 4. `analyze.normalize_threads`
 5. `analyze.attach_images`
-6. `ai.generate_category_candidates`
+6. `ai.generate_category_candidates`（非AI。category master を初期化）
 7. `analyze.split_thread_turns`
 8. `ai.summarize_turn`
 9. `ai.classify_turn`
@@ -205,6 +204,7 @@ Ollama の例:
   `artifacts/ai/categories.json`
 
 `freezeCategories: true` の場合は既存 master を固定再利用します。  
+`ai.generate_category_candidates` は設定済みの `categoryGroups` またはデフォルト大カテゴリから category master を初期化する非AI task です。  
 `ai.classify_thread` は必要時に `proposedCategories` を返し、master に新カテゴリを自動追加します。追加履歴は `artifacts/ai/category_suggestions.json` に残ります。
 
 ### 増分実行

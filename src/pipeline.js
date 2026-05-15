@@ -510,7 +510,12 @@ async function buildTaskMeta(runtime, definition, item) {
         return { inputHash: hashJson(loadThreads(runtime).map((thread) => ({ itemId: thread.itemId, attachments: thread.messages.reduce((sum, message) => sum + (message.attachments?.length || 0), 0), generatedImages: thread.messages.reduce((sum, message) => sum + (message.generatedImages?.length || 0), 0) }))), promptHash: null, model: null, promptPreview: null };
       case "ai.generate_category_candidates": {
         const groups = normalizeCategoryGroups(runtime.config.categoryGroups);
-        return aiMeta(runtime, "initialize category master from configured top-level groups", { groups });
+        return {
+          inputHash: hashJson({ schema: "category-master-v2", groups }),
+          promptHash: null,
+          model: null,
+          promptPreview: null
+        };
       }
       case "analyze.split_thread_turns": {
         const thread = readThread(runtime, item.itemId);
@@ -2441,7 +2446,7 @@ async function handleCategories(runtime, meta) {
       think: meta.think,
       promptHash: meta.promptHash,
       inputHash: meta.inputHash,
-      provider: aiProviderLabel(runtime),
+      provider: "local",
       cacheHit: Boolean(current)
     }
   });

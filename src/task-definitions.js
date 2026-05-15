@@ -33,7 +33,7 @@ export const TASK_DEFINITIONS = [
     stage: "ai.catalog",
     taskKey: "ai.generate_category_candidates",
     itemType: "run",
-    isAi: true
+    isAi: false
   },
   {
     stage: "analyze",

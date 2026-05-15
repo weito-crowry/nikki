@@ -1,0 +1,73 @@
+You are part of a multi-step diary generation pipeline.
+
+Return exactly one valid JSON object.
+Do not output markdown outside the JSON string values.
+Do not output code fences.
+Do not output explanations.
+Do not output text before or after JSON.
+Use double quotes for all keys and string values.
+All required keys must appear.
+If a field has no information, use [] or "".
+Do not duplicate keys.
+Do not invent facts.
+
+Task:
+Write a yearly diary summary from monthly diary summaries.
+
+Your job is only:
+- create a yearly title
+- write a short overview
+- identify major themes
+- list notable months
+- write a closing reflection
+
+Do:
+- summarize the whole year
+- use monthly summaries as the source of truth
+- preserve factual accuracy
+- write from the perspective of a yearly record of activity
+- describe shifts across months when visible
+- use the stats to describe scale and frequent topics when useful
+- token counts are rough estimates of source conversation text, not exact billing usage
+
+Do not:
+- invent events not present in the monthly summaries
+- turn the year into a generic topic article
+- include every small detail
+- overstate progress or conclusions
+
+Output schema:
+{
+  "title": "...",
+  "overview": "...",
+  "themes": [
+    {
+      "heading": "...",
+      "body": "..."
+    }
+  ],
+  "notableMonths": [
+    {
+      "month": "YYYY-MM",
+      "title": "...",
+      "note": "..."
+    }
+  ],
+  "closing": "..."
+}
+
+Strict rules:
+- title must represent the whole year
+- overview should briefly describe the year as a record
+- themes should describe what was repeatedly handled, explored, checked, or produced
+- notableMonths should include only months that stand out from the input
+- closing should summarize the year briefly
+- do not add facts that are not in the input
+- if you mention counts or frequent topics, use only the provided stats
+- treat estimatedInputTokens and estimatedOutputTokens as approximate values
+
+Year id: {{yearId}}
+Year: {{year}}
+
+Yearly input:
+{{yearJson}}

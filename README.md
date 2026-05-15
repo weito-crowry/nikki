@@ -116,6 +116,7 @@ npm run run:prod:ollama:qwen3.5-0.8b
     }
   },
   "grouping": "thread-start-day",
+  "executionOrder": "task",
   "model": "gpt-5-mini",
   "taskModels": {
     "ai.classify_thread": "gpt-5-mini",
@@ -177,15 +178,20 @@ Ollama の例:
 4. `analyze.normalize_threads`
 5. `analyze.attach_images`
 6. `ai.generate_category_candidates`
-7. `ai.classify_thread`
-8. `ai.extract_findings`
-9. `analyze.group_units`
-10. `ai.summarize_unit`
-11. `ai.write_diary_entry`
-12. `ai.rewrite_diary_entry`
-13. `render.markdown`
-14. `render.html`
-15. `render.pdf`
+7. `analyze.split_thread_turns`
+8. `ai.summarize_turn`
+9. `ai.classify_turn`
+10. `ai.merge_thread_turns`
+11. `analyze.group_units`
+12. `ai.summarize_unit`
+13. `ai.write_diary_entry`
+14. `ai.rewrite_diary_entry`
+15. `ai.write_weekly_summary`
+16. `ai.write_monthly_summary`
+17. `ai.write_yearly_summary`
+18. `render.markdown`
+19. `render.html`
+20. `render.pdf`
 
 各 task は `task-state/<taskKey>__<itemId>.json` で状態管理されます。
 
@@ -221,6 +227,22 @@ AI の再実行は極力抑える前提です。
 - render は日付別 post を持ち、変更 entry を中心に更新
 
 ただし、完全な部分更新ではなく、一部 task はまだ全体再構成寄りです。
+
+### 実行順序
+
+既定は従来通り task 単位で全 item を処理します。
+
+- `executionOrder: "task"`
+  - `ai.summarize_turn` を全 turn、`ai.classify_turn` を全 turn、という順で task ごとに処理
+- `executionOrder: "date"`
+  - prepare / index 作成後、対象日付ごとに thread / turn / unit / entry を処理
+  - 日次処理が終わった後に週次・月次・年次まとめと render を処理
+
+CLI でも指定できます。
+
+```bash
+node src/cli.js run --config ./nikki.config.json --execution-order date --skip-completed
+```
 
 ## よく使うオプション
 
@@ -296,6 +318,9 @@ output/run-001/
       unit_summaries/
       diary_drafts/
       diary_entries/
+      weekly_summaries/
+      monthly_summaries/
+      yearly_summaries/
     chunks/
     raw/
     units/
@@ -306,11 +331,23 @@ output/run-001/
       diary.html
       diary.pdf
       posts.json
+      weeks.json
+      months.json
+      years.json
       index.md
       index.html
       posts/
         YYYY-MM-DD.md
         YYYY-MM-DD.html
+      weeks/
+        YYYY-MM-Wn.md
+        YYYY-MM-Wn.html
+      months/
+        YYYY-MM.md
+        YYYY-MM.html
+      years/
+        YYYY.md
+        YYYY.html
 ```
 
 ## 最終成果物
@@ -324,6 +361,9 @@ output/run-001/
 - ブログ風の個別記事
   - `artifacts/render/index.html`
   - `artifacts/render/posts/*.html`
+  - `artifacts/render/weeks/*.html`
+  - `artifacts/render/months/*.html`
+  - `artifacts/render/years/*.html`
 
 個別記事 HTML は、
 

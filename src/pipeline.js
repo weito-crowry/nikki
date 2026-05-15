@@ -46,15 +46,10 @@ export async function runPipeline(inputConfig) {
   writeProgress(runtime, { status: "running", note: "初期化完了", lastEvent: "run.started" });
 
   try {
-    for (const definition of TASK_DEFINITIONS) {
-      throwIfStopRequested(runtime);
-      const items = enumerateItems(runtime, definition.itemType);
-      const runnableItems = registerPlanned(runtime, definition, items);
-      for (const item of runnableItems) {
-        throwIfStopRequested(runtime);
-        await executeTask(runtime, definition, item);
-        throwIfStopRequested(runtime);
-      }
+    if (runtime.config.executionOrder === "date") {
+      await runPipelineDateOrder(runtime);
+    } else {
+      await runPipelineTaskOrder(runtime);
     }
     emitEvent(runtime, { type: "run.completed", note: "完了" });
     writeProgress(runtime, { status: "completed", note: "完了", lastEvent: "run.completed", stage: null, taskKey: null, itemType: null, currentItemId: null, currentTaskInstanceId: null });
@@ -86,6 +81,97 @@ export async function runPipeline(inputConfig) {
   }
 }
 
+async function runPipelineTaskOrder(runtime) {
+  for (const definition of TASK_DEFINITIONS) {
+    throwIfStopRequested(runtime);
+    await executeDefinitionItems(runtime, definition);
+  }
+}
+
+async function runPipelineDateOrder(runtime) {
+  const originalDate = runtime.config.date || null;
+  const initialTaskKeys = [
+    "prepare.extract_export",
+    "prepare.scan_export",
+    "prepare.build_thread_index",
+    "analyze.normalize_threads",
+    "analyze.attach_images",
+    "ai.generate_category_candidates"
+  ];
+  const dailyTaskKeys = [
+    "analyze.split_thread_turns",
+    "ai.summarize_turn",
+    "ai.classify_turn",
+    "ai.merge_thread_turns",
+    "analyze.group_units",
+    "ai.summarize_unit",
+    "ai.write_diary_entry",
+    "ai.rewrite_diary_entry"
+  ];
+  const archiveTaskKeys = [
+    "ai.write_weekly_summary",
+    "ai.write_monthly_summary",
+    "ai.write_yearly_summary",
+    "render.markdown",
+    "render.html",
+    "render.pdf"
+  ];
+
+  try {
+    runtime.config.date = originalDate;
+    for (const taskKey of initialTaskKeys) {
+      throwIfStopRequested(runtime);
+      await executeDefinitionItems(runtime, taskDefinitionByKey(taskKey));
+    }
+
+    const dates = originalDate ? [originalDate] : enumerateExecutionDates(runtime);
+    for (const date of dates) {
+      throwIfStopRequested(runtime);
+      runtime.config.date = date;
+      logConsole("date", date, "日付単位の処理を開始します");
+      for (const taskKey of dailyTaskKeys) {
+        throwIfStopRequested(runtime);
+        await executeDefinitionItems(runtime, taskDefinitionByKey(taskKey));
+      }
+    }
+
+    runtime.config.date = originalDate;
+    for (const taskKey of archiveTaskKeys) {
+      throwIfStopRequested(runtime);
+      await executeDefinitionItems(runtime, taskDefinitionByKey(taskKey));
+    }
+  } finally {
+    runtime.config.date = originalDate;
+  }
+}
+
+async function executeDefinitionItems(runtime, definition) {
+  if (!definition) {
+    return;
+  }
+  const items = enumerateItems(runtime, definition.itemType);
+  const runnableItems = registerPlanned(runtime, definition, items);
+  for (const item of runnableItems) {
+    throwIfStopRequested(runtime);
+    await executeTask(runtime, definition, item);
+    throwIfStopRequested(runtime);
+  }
+}
+
+function taskDefinitionByKey(taskKey) {
+  return TASK_DEFINITIONS.find((definition) => definition.taskKey === taskKey) || null;
+}
+
+function enumerateExecutionDates(runtime) {
+  const dates = new Set();
+  for (const thread of loadScopedThreadIndex(runtime)) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(String(thread.primaryDate || ""))) {
+      dates.add(thread.primaryDate);
+    }
+  }
+  return [...dates].sort((left, right) => left.localeCompare(right, "ja"));
+}
+
 function createRuntime(config) {
   const runId = sanitizeId(config.runId || path.basename(config.outputDir || "run"));
   const now = isoJst();
@@ -110,7 +196,7 @@ function createRuntime(config) {
     invalidated: new Set(),
     taskDurations: { started: new Map(), completedMsByTaskKey: new Map() },
     counts: { total: 0, pending: 0, running: 0, completed: 0, failed: 0, skipped: 0 },
-    current: { stage: null, taskKey: null, itemType: null, itemId: null, itemMeta: null, taskInstanceId: null, promptPreview: null, sentAt: null, lastEvent: null, note: null },
+    current: { stage: null, taskKey: null, itemType: null, itemId: null, itemMeta: null, taskInstanceId: null, promptPreview: null, promptStats: null, sentAt: null, lastEvent: null, note: null },
     lock: null,
     stopRequested: false,
     stopReason: null
@@ -198,12 +284,18 @@ function initRun(runtime) {
       "artifacts/ai/thread_summaries",
       "artifacts/ai/thread_classification",
       "artifacts/ai/thread_findings",
-      "artifacts/ai/unit_summaries",
+    "artifacts/ai/unit_summaries",
     "artifacts/ai/diary_drafts",
     "artifacts/ai/diary_entries",
+    "artifacts/ai/weekly_summaries",
+    "artifacts/ai/monthly_summaries",
+    "artifacts/ai/yearly_summaries",
       "artifacts/raw",
     "artifacts/units",
     "artifacts/render",
+    "artifacts/render/weeks",
+    "artifacts/render/months",
+    "artifacts/render/years",
     "task-state",
     "cache/ai",
     "logs"
@@ -286,7 +378,7 @@ function enumerateItems(runtime, itemType) {
     return (readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || []).map((meta) => ({ itemId: meta.itemId, meta }));
   }
   if (itemType === "turn") {
-    return (readArtifact(runtime, "artifacts/indexes/turn-index.json")?.turns || []).map((meta) => ({ itemId: meta.itemId, meta }));
+    return loadTurns(runtime).map((meta) => ({ itemId: meta.itemId, meta }));
   }
   if (itemType === "unit") {
     return (readArtifact(runtime, "artifacts/units/units.json")?.items || []).map((meta) => ({ itemId: meta.itemId, meta }));
@@ -304,6 +396,15 @@ function enumerateItems(runtime, itemType) {
       }
     }
     return [...map.values()];
+  }
+  if (itemType === "week") {
+    return enumerateWeekItems(runtime);
+  }
+  if (itemType === "month") {
+    return enumerateMonthItems(runtime);
+  }
+  if (itemType === "year") {
+    return enumerateYearItems(runtime);
   }
   return [];
 }
@@ -333,7 +434,7 @@ function recordTaskDuration(runtime, taskKey, instanceId) {
 
 async function executeTask(runtime, definition, item) {
   const instanceId = taskInstanceId(definition.taskKey, item.itemId);
-  runtime.current = { stage: definition.stage, taskKey: definition.taskKey, itemType: definition.itemType, itemId: item.itemId, itemMeta: item.meta || null, taskInstanceId: instanceId, promptPreview: null, sentAt: null, lastEvent: null, note: null };
+  runtime.current = { stage: definition.stage, taskKey: definition.taskKey, itemType: definition.itemType, itemId: item.itemId, itemMeta: item.meta || null, taskInstanceId: instanceId, promptPreview: null, promptStats: null, sentAt: null, lastEvent: null, note: null };
   const meta = await buildTaskMeta(runtime, definition, item);
   const dependsOn = resolveDependsOn(runtime, definition.taskKey, item.itemId);
   let state = readState(runtime, definition.taskKey, item.itemId);
@@ -412,7 +513,7 @@ async function buildTaskMeta(runtime, definition, item) {
         return aiMeta(runtime, "initialize category master from configured top-level groups", { groups });
       }
       case "analyze.split_thread_turns": {
-        const thread = readThread(item.itemId);
+        const thread = readThread(runtime, item.itemId);
         return { inputHash: hashJson(thread), promptHash: null, model: null, promptPreview: null };
       }
       case "ai.summarize_turn": {
@@ -433,24 +534,22 @@ async function buildTaskMeta(runtime, definition, item) {
         return aiMeta(runtime, prompt, { categories, turn });
       }
       case "ai.merge_thread_turns": {
-        const turns = loadTurnsForThread(runtime, item.itemId);
-        const rawTurnClassifications = turns
-          .map((turn) => readArtifact(runtime, `artifacts/ai/turn_classification/${turn.itemId}.json`))
-          .filter(Boolean);
-        const turnSummaries = turns
-          .map((turn) => compactTurnSummaryForMerge(readArtifact(runtime, `artifacts/ai/turn_summaries/${turn.itemId}.json`)))
-          .filter(Boolean);
-        const categories = readCategoryMaster(runtime) || {};
-        const mergedClassification = compactMergedClassificationForMerge(mergeClassificationResults(rawTurnClassifications), categories);
-        const payload = {
-          thread: compactThreadForMerge(readThread(item.itemId)),
-          turnSummaries,
-          mergedClassification
-        };
-        const prompt = renderPromptTemplate("ai.merge_thread_turns", {
-          payloadJson: JSON.stringify(payload, null, 2)
-        });
-        return aiMeta(runtime, prompt, payload);
+        const context = buildThreadMergeContext(runtime, item.itemId);
+        const prompt = buildMergeThreadTurnsPrompt(context.payload);
+        const promptStats = buildPromptStats({ prompt, systemPrompt: getOllamaSystemPrompt(runtime.config) });
+        const tokenLimit = threadMergeInputTokenLimit(runtime);
+        if (promptStats.estimatedInputTokens > tokenLimit) {
+          const templateHash = hashText(renderPromptTemplate("ai.merge_thread_turns", { payloadJson: "" }));
+          const strategy = {
+            mode: "chunked",
+            estimatedInputTokens: promptStats.estimatedInputTokens,
+            tokenLimit,
+            chunkSize: threadMergeChunkSize(runtime),
+            templateHash
+          };
+          return aiMeta(runtime, `chunked ai.merge_thread_turns ${JSON.stringify(strategy)}`, { ...context.input, strategy });
+        }
+        return aiMeta(runtime, prompt, context.input);
       }
       case "analyze.group_units":
         return {
@@ -504,8 +603,50 @@ async function buildTaskMeta(runtime, definition, item) {
       });
       return aiMeta(runtime, prompt, payload);
     }
+    case "ai.write_weekly_summary": {
+      const weekInput = readWeekInput(runtime, item.itemId);
+      const payload = {
+        week: weekInput.week,
+        stats: compactArchiveStatsForAi(weekInput.stats),
+        entries: weekInput.entries.map((entry) => compactDiaryEntryForArchiveSummary(entry))
+      };
+      const prompt = renderPromptTemplate("ai.write_weekly_summary", {
+        weekId: item.itemId,
+        week: weekInput.week,
+        weekJson: JSON.stringify(payload, null, 2)
+      });
+      return aiMeta(runtime, prompt, payload);
+    }
+    case "ai.write_monthly_summary": {
+      const monthInput = readMonthInput(runtime, item.itemId);
+      const payload = {
+        month: monthInput.month,
+        stats: compactArchiveStatsForAi(monthInput.stats),
+        weeks: monthInput.weeklySummaries.map((summary) => compactWeekSummaryForMonthlySummary(summary))
+      };
+      const prompt = renderPromptTemplate("ai.write_monthly_summary", {
+        monthId: item.itemId,
+        month: monthInput.month,
+        monthJson: JSON.stringify(payload, null, 2)
+      });
+      return aiMeta(runtime, prompt, payload);
+    }
+    case "ai.write_yearly_summary": {
+      const yearInput = readYearInput(runtime, item.itemId);
+      const payload = {
+        year: yearInput.year,
+        stats: compactArchiveStatsForAi(yearInput.stats),
+        months: yearInput.monthlySummaries.map((summary) => compactMonthSummaryForYearlySummary(summary))
+      };
+      const prompt = renderPromptTemplate("ai.write_yearly_summary", {
+        yearId: item.itemId,
+        year: yearInput.year,
+        yearJson: JSON.stringify(payload, null, 2)
+      });
+      return aiMeta(runtime, prompt, payload);
+    }
     case "render.markdown":
-      return { inputHash: hashJson({ grouping: runtime.config.grouping, entries: loadDiaryEntries(runtime) }), promptHash: null, model: null, promptPreview: null };
+      return { inputHash: hashJson({ grouping: runtime.config.grouping, entries: loadDiaryEntries(runtime), weeklySummaries: loadWeeklySummaries(runtime), monthlySummaries: loadMonthlySummaries(runtime), yearlySummaries: loadYearlySummaries(runtime) }), promptHash: null, model: null, promptPreview: null };
     case "render.html":
       return { inputHash: hashJson(readArtifact(runtime, "artifacts/render/diary.json") || {}), promptHash: null, model: null, promptPreview: null };
     case "render.pdf":
@@ -734,7 +875,7 @@ function buildThreadGroups(thread) {
 }
 
 function buildTurnsFromThread(thread) {
-  return buildThreadGroups(thread).map((group, index) => ({
+  return buildThreadGroups(thread).filter(isNonEmptyTurnGroup).map((group, index) => ({
     itemId: `${thread.itemId}_turn_${String(index + 1).padStart(4, "0")}`,
     threadItemId: thread.itemId,
     turnIndex: index + 1,
@@ -742,6 +883,24 @@ function buildTurnsFromThread(thread) {
     promptMessages: group.promptMessages || [],
     responseMessages: group.responseMessages || []
   }));
+}
+
+function isNonEmptyTurnGroup(group) {
+  const messages = [...(group?.promptMessages || []), ...(group?.responseMessages || [])];
+  return messages.some((message) => isDiaryRelevantMessage(message));
+}
+
+function isDiaryRelevantMessage(message) {
+  if (!message || message.role === "system") {
+    return false;
+  }
+  if (typeof message.text === "string" && message.text.trim()) {
+    return true;
+  }
+  return Number(message.attachmentCount || 0) > 0
+    || Number(message.generatedImageCount || 0) > 0
+    || (Array.isArray(message.attachments) && message.attachments.length > 0)
+    || (Array.isArray(message.generatedImages) && message.generatedImages.length > 0);
 }
 
 function finalizeThreadGroup(group, index) {
@@ -1370,6 +1529,199 @@ function compactDiaryDraftForAi(draft) {
   };
 }
 
+function enumerateWeekItems(runtime) {
+  const entries = loadDiaryEntries(runtime);
+  const units = readArtifact(runtime, "artifacts/units/units.json")?.items || [];
+  const threadIdsByEntry = buildThreadIdsByEntry(units);
+  const map = new Map();
+  for (const entry of entries) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(entry.date || ""))) {
+      continue;
+    }
+    const week = monthWeekKey(entry.date);
+    if (!week) {
+      continue;
+    }
+    const itemId = `week_${week}`;
+    if (!map.has(itemId)) {
+      map.set(itemId, { itemId, meta: { itemId, week, month: week.slice(0, 7), year: week.slice(0, 4), date: entry.date, entryIds: [], threadItemIds: [] } });
+    }
+    const meta = map.get(itemId).meta;
+    if (entry.date < meta.date) {
+      meta.date = entry.date;
+    }
+    meta.entryIds.push(entry.itemId);
+    for (const threadItemId of threadIdsByEntry.get(entry.itemId) || []) {
+      if (!meta.threadItemIds.includes(threadItemId)) {
+        meta.threadItemIds.push(threadItemId);
+      }
+    }
+  }
+  return [...map.values()].sort((a, b) => a.meta.week.localeCompare(b.meta.week, "ja"));
+}
+
+function enumerateMonthItems(runtime) {
+  const weeks = enumerateWeekItems(runtime);
+  const map = new Map();
+  for (const weekItem of weeks) {
+    const month = weekItem.meta.month;
+    const itemId = `month_${month}`;
+    if (!map.has(itemId)) {
+      map.set(itemId, { itemId, meta: { itemId, month, date: `${month}-01`, weekIds: [], entryIds: [], threadItemIds: [] } });
+    }
+    const meta = map.get(itemId).meta;
+    meta.weekIds.push(weekItem.itemId);
+    meta.entryIds.push(...(weekItem.meta.entryIds || []));
+    for (const threadItemId of weekItem.meta.threadItemIds || []) {
+      if (!meta.threadItemIds.includes(threadItemId)) {
+        meta.threadItemIds.push(threadItemId);
+      }
+    }
+  }
+  return [...map.values()].sort((a, b) => a.meta.month.localeCompare(b.meta.month, "ja"));
+}
+
+function enumerateYearItems(runtime) {
+  const months = enumerateMonthItems(runtime);
+  const map = new Map();
+  for (const monthItem of months) {
+    const year = monthItem.meta.month.slice(0, 4);
+    const itemId = `year_${year}`;
+    if (!map.has(itemId)) {
+      map.set(itemId, { itemId, meta: { itemId, year, date: `${year}-01-01`, monthIds: [], threadItemIds: [] } });
+    }
+    const meta = map.get(itemId).meta;
+    meta.monthIds.push(monthItem.itemId);
+    for (const threadItemId of monthItem.meta.threadItemIds || []) {
+      if (!meta.threadItemIds.includes(threadItemId)) {
+        meta.threadItemIds.push(threadItemId);
+      }
+    }
+  }
+  return [...map.values()].sort((a, b) => a.meta.year.localeCompare(b.meta.year, "ja"));
+}
+
+function buildThreadIdsByEntry(units) {
+  const map = new Map();
+  for (const unit of units || []) {
+    if (!unit.entryId) {
+      continue;
+    }
+    if (!map.has(unit.entryId)) {
+      map.set(unit.entryId, []);
+    }
+    for (const threadItemId of unit.threadItemIds || []) {
+      if (!map.get(unit.entryId).includes(threadItemId)) {
+        map.get(unit.entryId).push(threadItemId);
+      }
+    }
+  }
+  return map;
+}
+
+function compactDiaryEntryForArchiveSummary(entry) {
+  return {
+    itemId: entry.itemId || "",
+    date: entry.date || null,
+    title: entry.title || "",
+    markdownBody: clip(entry.markdownBody || "", 2200)
+  };
+}
+
+function compactWeekSummaryForMonthlySummary(summary) {
+  return {
+    itemId: summary.itemId || "",
+    week: summary.week || null,
+    title: summary.title || "",
+    overview: clip(summary.overview || "", 900),
+    themes: (summary.themes || []).map((theme) => ({
+      heading: theme?.heading || "",
+      body: clip(theme?.body || "", 900)
+    })),
+    notableDays: (summary.notableDays || []).map((day) => ({
+      date: day?.date || "",
+      title: day?.title || "",
+      note: clip(day?.note || "", 300)
+    })),
+    closing: clip(summary.closing || "", 700)
+  };
+}
+
+function compactArchiveStatsForAi(stats) {
+  return {
+    dayCount: stats.dayCount,
+    weekCount: stats.weekCount || 0,
+    monthCount: stats.monthCount || 0,
+    threadCount: stats.threadCount,
+    messageCount: stats.messageCount,
+    userMessageCount: stats.userMessageCount,
+    assistantMessageCount: stats.assistantMessageCount,
+    estimatedInputTokens: stats.estimatedInputTokens,
+    estimatedOutputTokens: stats.estimatedOutputTokens,
+    estimatedTotalTokens: stats.estimatedTotalTokens,
+    generatedImageCount: stats.generatedImageCount,
+    topCategories: (stats.topCategories || []).slice(0, 12),
+    topPrimaryCategories: (stats.topPrimaryCategories || []).slice(0, 12)
+  };
+}
+
+function compactMonthSummaryForYearlySummary(summary) {
+  return {
+    itemId: summary.itemId || "",
+    month: summary.month || null,
+    title: summary.title || "",
+    overview: clip(summary.overview || "", 900),
+    themes: (summary.themes || []).map((theme) => ({
+      heading: theme?.heading || "",
+      body: clip(theme?.body || "", 900)
+    })),
+    notableWeeks: (summary.notableWeeks || []).map((week) => ({
+      week: week?.week || "",
+      title: week?.title || "",
+      note: clip(week?.note || "", 300)
+    })),
+    closing: clip(summary.closing || "", 700)
+  };
+}
+
+function readWeekInput(runtime, weekItemId) {
+  const week = String(weekItemId).replace(/^week_/, "");
+  const entries = loadDiaryEntries(runtime)
+    .filter((entry) => monthWeekKey(entry.date) === week)
+    .sort((a, b) => (a.date || "").localeCompare(b.date || "", "ja"));
+  return { itemId: weekItemId, week, entries, stats: buildArchiveStatsFromEntries(runtime, entries, { weekCount: 1 }) };
+}
+
+function readMonthInput(runtime, monthItemId) {
+  const month = String(monthItemId).replace(/^month_/, "");
+  const weeks = enumerateWeekItems(runtime)
+    .map((item) => item.meta.week)
+    .filter((week) => week.startsWith(month))
+    .sort((a, b) => a.localeCompare(b, "ja"));
+  const weeklySummaries = weeks
+    .map((week) => readArtifact(runtime, `artifacts/ai/weekly_summaries/week_${week}.json`))
+    .filter(Boolean);
+  const entries = loadDiaryEntries(runtime)
+    .filter((entry) => String(entry.date || "").startsWith(`${month}-`))
+    .sort((a, b) => (a.date || "").localeCompare(b.date || "", "ja"));
+  return { itemId: monthItemId, month, weeks, weeklySummaries, entries, stats: buildArchiveStatsFromEntries(runtime, entries, { monthCount: 1, weekCount: weeks.length }) };
+}
+
+function readYearInput(runtime, yearItemId) {
+  const year = String(yearItemId).replace(/^year_/, "");
+  const months = enumerateMonthItems(runtime)
+    .map((item) => item.meta.month)
+    .filter((month) => month.startsWith(year))
+    .sort((a, b) => a.localeCompare(b, "ja"));
+  const monthlySummaries = months
+    .map((month) => readArtifact(runtime, `artifacts/ai/monthly_summaries/month_${month}.json`))
+    .filter(Boolean);
+  const entries = loadDiaryEntries(runtime)
+    .filter((entry) => String(entry.date || "").startsWith(`${year}-`))
+    .sort((a, b) => (a.date || "").localeCompare(b.date || "", "ja"));
+  return { itemId: yearItemId, year, months, monthlySummaries, entries, stats: buildArchiveStatsFromEntries(runtime, entries, { monthCount: months.length }) };
+}
+
 function resolveDependsOn(runtime, taskKey, itemId) {
   if (taskKey === "prepare.extract_export") return [];
   if (taskKey === "prepare.scan_export") return [taskInstanceId("prepare.extract_export", "run")];
@@ -1387,7 +1739,10 @@ function resolveDependsOn(runtime, taskKey, itemId) {
   if (taskKey === "ai.summarize_unit") return readUnit(runtime, itemId).threadItemIds.filter((threadItemId) => hasThreadSummaryInputs(runtime, threadItemId)).map((threadItemId) => taskInstanceId("ai.merge_thread_turns", threadItemId));
   if (taskKey === "ai.write_diary_entry") return readEntry(runtime, itemId).unitSummaries.map((unitSummary) => taskInstanceId("ai.summarize_unit", unitSummary.itemId));
   if (taskKey === "ai.rewrite_diary_entry") return [taskInstanceId("ai.write_diary_entry", itemId)];
-  if (taskKey === "render.markdown") return loadDiaryEntries(runtime).map((entry) => taskInstanceId("ai.rewrite_diary_entry", entry.itemId));
+  if (taskKey === "ai.write_weekly_summary") return readWeekInput(runtime, itemId).entries.map((entry) => taskInstanceId("ai.rewrite_diary_entry", entry.itemId));
+  if (taskKey === "ai.write_monthly_summary") return readMonthInput(runtime, itemId).weeks.map((week) => taskInstanceId("ai.write_weekly_summary", `week_${week}`));
+  if (taskKey === "ai.write_yearly_summary") return readYearInput(runtime, itemId).months.map((month) => taskInstanceId("ai.write_monthly_summary", `month_${month}`));
+  if (taskKey === "render.markdown") return [...loadDiaryEntries(runtime).map((entry) => taskInstanceId("ai.rewrite_diary_entry", entry.itemId)), ...enumerateWeekItems(runtime).map((item) => taskInstanceId("ai.write_weekly_summary", item.itemId)), ...enumerateMonthItems(runtime).map((item) => taskInstanceId("ai.write_monthly_summary", item.itemId)), ...enumerateYearItems(runtime).map((item) => taskInstanceId("ai.write_yearly_summary", item.itemId))];
   if (taskKey === "render.html") return [taskInstanceId("render.markdown", "run")];
   if (taskKey === "render.pdf") return [taskInstanceId("render.html", "run")];
   return [];
@@ -1462,7 +1817,10 @@ function isPersistentAiTask(definition) {
     "ai.merge_thread_turns",
     "ai.summarize_unit",
     "ai.write_diary_entry",
-    "ai.rewrite_diary_entry"
+    "ai.rewrite_diary_entry",
+    "ai.write_weekly_summary",
+    "ai.write_monthly_summary",
+    "ai.write_yearly_summary"
   ].includes(definition.taskKey));
 }
 
@@ -1519,6 +1877,9 @@ function migrateReusableState(runtime, definition, item, state, meta, dependsOn)
 }
 
 function validateRunOptions(runtime) {
+  if (!["task", "date"].includes(runtime.config.executionOrder || "task")) {
+    throw new Error(`executionOrder は task または date で指定してください: ${runtime.config.executionOrder}`);
+  }
   if (runtime.config.date && !/^\d{4}-\d{2}-\d{2}$/.test(runtime.config.date)) {
     throw new Error(`--date の形式が不正です: ${runtime.config.date}`);
   }
@@ -1639,6 +2000,9 @@ function matchesRerunScope(taskKey, scopes) {
     "ai.summarize_unit",
     "ai.write_diary_entry",
     "ai.rewrite_diary_entry",
+    "ai.write_weekly_summary",
+    "ai.write_monthly_summary",
+    "ai.write_yearly_summary",
     "render.markdown",
     "render.html",
     "render.pdf"
@@ -1661,7 +2025,7 @@ function matchesTargetThreadFilter(runtime, itemType, meta) {
   if (itemType === "turn") {
     return threadItemMatchesTargetScopes(runtime, meta.threadItemId);
   }
-  if (itemType === "unit" || itemType === "entry") {
+  if (itemType === "unit" || itemType === "entry" || itemType === "week" || itemType === "month" || itemType === "year") {
     return (meta.threadItemIds || []).some((threadItemId) => threadItemMatchesTargetScopes(runtime, threadItemId));
   }
   return true;
@@ -1676,6 +2040,15 @@ function matchesDateFilter(itemType, meta, date) {
   }
   if (itemType === "turn") {
     return meta.date === date;
+  }
+  if (itemType === "week") {
+    return meta.week === monthWeekKey(date);
+  }
+  if (itemType === "month") {
+    return meta.month === date.slice(0, 7);
+  }
+  if (itemType === "year") {
+    return meta.year === date.slice(0, 4);
   }
   return meta.date === date || meta.itemId === `entry_${date}` || meta.itemId === `unit_date_${date}`;
 }
@@ -1695,6 +2068,9 @@ async function runHandler(runtime, taskKey, itemId, meta) {
   if (taskKey === "ai.summarize_unit") return handleSummarizeUnit(runtime, itemId, meta);
   if (taskKey === "ai.write_diary_entry") return handleWriteEntry(runtime, itemId, meta);
   if (taskKey === "ai.rewrite_diary_entry") return handleRewriteEntry(runtime, itemId, meta);
+  if (taskKey === "ai.write_weekly_summary") return handleWriteWeeklySummary(runtime, itemId, meta);
+  if (taskKey === "ai.write_monthly_summary") return handleWriteMonthlySummary(runtime, itemId, meta);
+  if (taskKey === "ai.write_yearly_summary") return handleWriteYearlySummary(runtime, itemId, meta);
   if (taskKey === "render.markdown") return handleRenderMarkdown(runtime);
   if (taskKey === "render.html") return handleRenderHtml(runtime);
   if (taskKey === "render.pdf") return handleRenderPdf(runtime);
@@ -1842,14 +2218,12 @@ async function handleClassifyTurn(runtime, itemId, meta) {
 }
 
 async function handleMergeThreadTurns(runtime, itemId, meta) {
-  const response = await askForJson(runtime, "ai.merge_thread_turns", itemId, `thread-merge-${itemId}`, meta);
+  const context = buildThreadMergeContext(runtime, itemId);
+  const response = await askForMergedThreadJson(runtime, itemId, meta, context);
   const categories = readCategoryMaster(runtime) || {};
   const categoryLabels = new Map((categories.categories || []).map((category) => [category.id, category.label]));
   const groupLabels = new Map((categories.groups || []).map((group) => [group.id, group.label]));
-  const turnClassifications = loadTurnsForThread(runtime, itemId)
-    .map((turn) => readArtifact(runtime, `artifacts/ai/turn_classification/${turn.itemId}.json`))
-    .filter(Boolean);
-  const mergedClassification = mergeClassificationResults(turnClassifications);
+  const mergedClassification = context.mergedClassificationRaw;
   const primaryGroup = mergedClassification.primaryGroup || "other";
   const primaryCategory = mergedClassification.primaryCategory || mergedClassification.primary || "uncategorized";
   const secondaryCategories = Array.isArray(mergedClassification.secondaryCategories)
@@ -1861,6 +2235,7 @@ async function handleMergeThreadTurns(runtime, itemId, meta) {
     `artifacts/ai/thread_classification/${itemId}.json`,
     `artifacts/ai/thread_findings/${itemId}.json`,
     `artifacts/ai/thread_summaries/${itemId}.json`,
+    ...response.artifactPaths,
     `artifacts/raw/ai.merge_thread_turns/${itemId}.raw.json`
   ];
   writeArtifact(runtime, `artifacts/ai/thread_classification/${itemId}.json`, {
@@ -1878,7 +2253,7 @@ async function handleMergeThreadTurns(runtime, itemId, meta) {
     secondary: secondaryCategories,
     reason: response.parsed.reason || mergedClassification.reason || "",
     proposedCategories: [],
-    aiMeta: buildAiMeta(runtime, meta, response, { classificationMergedInCode: true })
+    aiMeta: buildAiMeta(runtime, meta, response, { classificationMergedInCode: true, mergeStrategy: response.mergeStrategy })
   });
   writeArtifact(runtime, `artifacts/ai/thread_findings/${itemId}.json`, {
     schemaVersion: 1,
@@ -1890,7 +2265,7 @@ async function handleMergeThreadTurns(runtime, itemId, meta) {
     outcomes: Array.isArray(response.parsed.outcomes) ? response.parsed.outcomes : [],
     images: Array.isArray(response.parsed.images) ? response.parsed.images : [],
     narrative: response.parsed.narrative || "",
-    aiMeta: buildAiMeta(runtime, meta, response)
+    aiMeta: buildAiMeta(runtime, meta, response, { mergeStrategy: response.mergeStrategy })
   });
   writeArtifact(runtime, `artifacts/ai/thread_summaries/${itemId}.json`, {
     schemaVersion: 1,
@@ -1899,10 +2274,161 @@ async function handleMergeThreadTurns(runtime, itemId, meta) {
     itemId,
     summaryTitle: response.parsed.summaryTitle || "",
     narrative: response.parsed.narrative || "",
-    aiMeta: buildAiMeta(runtime, meta, response)
+    aiMeta: buildAiMeta(runtime, meta, response, { mergeStrategy: response.mergeStrategy })
   });
   writeRaw(runtime, "ai.merge_thread_turns", itemId, response.text, response.usage);
   return artifactPaths;
+}
+
+async function askForMergedThreadJson(runtime, itemId, meta, context) {
+  const prompt = buildMergeThreadTurnsPrompt(context.payload);
+  const promptStats = buildPromptStats({ prompt, systemPrompt: getOllamaSystemPrompt(runtime.config) });
+  const tokenLimit = threadMergeInputTokenLimit(runtime);
+  if (promptStats.estimatedInputTokens <= tokenLimit) {
+    return { ...(await askForJson(runtime, "ai.merge_thread_turns", itemId, `thread-merge-${itemId}`, meta)), artifactPaths: [], mergeStrategy: { mode: "single", estimatedInputTokens: promptStats.estimatedInputTokens, tokenLimit } };
+  }
+  return askForChunkedMergedThreadJson(runtime, itemId, meta, context, promptStats.estimatedInputTokens, tokenLimit);
+}
+
+async function askForChunkedMergedThreadJson(runtime, itemId, meta, context, initialEstimatedInputTokens, tokenLimit) {
+  let level = 1;
+  let summaries = context.turnSummaries;
+  const artifactPaths = [];
+  const usages = [];
+  const chunkSize = threadMergeChunkSize(runtime);
+  const maxLevels = Number(runtime.config.threadMergeMaxLevels || 8);
+  logConsole("plan", `ai.merge_thread_turns__${itemId}`, `入力が大きいためチャンク統合します input≈${formatInteger(initialEstimatedInputTokens)}tok limit=${formatInteger(tokenLimit)} chunkSize=${chunkSize}`);
+
+  while (level <= maxLevels) {
+    const chunks = splitThreadMergeSummaries(runtime, context, summaries, tokenLimit, chunkSize);
+    logConsole("plan", `ai.merge_thread_turns__${itemId}`, `merge level=${level} summaries=${summaries.length} chunks=${chunks.length}`);
+    if (chunks.length <= 1) {
+      const finalPayload = { ...context.payload, turnSummaries: summaries };
+      const finalMeta = buildMergeThreadTurnsAiMeta(runtime, meta, finalPayload, { mode: "chunked-final", level, sourceSummaryCount: summaries.length, initialEstimatedInputTokens, tokenLimit });
+      const finalResponse = await askForJson(runtime, "ai.merge_thread_turns", itemId, `thread-merge-${itemId}-final`, finalMeta);
+      return {
+        ...finalResponse,
+        usage: mergeAiUsages([...usages, finalResponse.usage]),
+        artifactPaths,
+        mergeStrategy: { mode: "chunked", levels: level - 1, chunks: artifactPaths.length, initialEstimatedInputTokens, tokenLimit, chunkSize }
+      };
+    }
+
+    const nextSummaries = [];
+    for (let index = 0; index < chunks.length; index += 1) {
+      const chunkNumber = index + 1;
+      const chunkId = `${itemId}__level_${String(level).padStart(2, "0")}__chunk_${String(chunkNumber).padStart(3, "0")}`;
+      const chunkPayload = { ...context.payload, turnSummaries: chunks[index], partialMerge: { level, chunkNumber, chunkCount: chunks.length } };
+      const chunkMeta = buildMergeThreadTurnsAiMeta(runtime, meta, chunkPayload, { mode: "chunk", level, chunkNumber, chunkCount: chunks.length, initialEstimatedInputTokens, tokenLimit });
+      const response = await askForJson(runtime, "ai.merge_thread_turns", chunkId, `thread-merge-${chunkId}`, chunkMeta);
+      usages.push(response.usage);
+      const artifactPath = `artifacts/ai/thread_merge_chunks/${itemId}/level_${String(level).padStart(2, "0")}_chunk_${String(chunkNumber).padStart(3, "0")}.json`;
+      writeArtifact(runtime, artifactPath, {
+        schemaVersion: 1,
+        generatedAt: isoJst(),
+        runId: runtime.config.runId,
+        itemId: chunkId,
+        threadItemId: itemId,
+        level,
+        chunkNumber,
+        chunkCount: chunks.length,
+        sourceSummaryCount: chunks[index].length,
+        summary: response.parsed,
+        aiMeta: buildAiMeta(runtime, chunkMeta, response, { mergeStrategy: { mode: "chunk", level, chunkNumber, chunkCount: chunks.length } })
+      });
+      artifactPaths.push(artifactPath, `artifacts/raw/ai.merge_thread_turns/${chunkId}.raw.json`);
+      nextSummaries.push(compactPartialThreadSummaryForMerge(response.parsed, level, chunkNumber));
+    }
+    summaries = nextSummaries;
+    level += 1;
+  }
+
+  throw new Error(`thread merge の階層統合が最大段数を超えました: ${itemId} levels=${maxLevels}`);
+}
+
+function buildThreadMergeContext(runtime, itemId) {
+  const turns = loadTurnsForThread(runtime, itemId);
+  const rawTurnClassifications = turns
+    .map((turn) => readArtifact(runtime, `artifacts/ai/turn_classification/${turn.itemId}.json`))
+    .filter(Boolean);
+  const turnSummaries = turns
+    .map((turn) => compactTurnSummaryForMerge(readArtifact(runtime, `artifacts/ai/turn_summaries/${turn.itemId}.json`)))
+    .filter(Boolean);
+  const categories = readCategoryMaster(runtime) || {};
+  const mergedClassificationRaw = mergeClassificationResults(rawTurnClassifications);
+  const mergedClassification = compactMergedClassificationForMerge(mergedClassificationRaw, categories);
+  const payload = {
+    thread: compactThreadForMerge(readThread(runtime, itemId)),
+    turnSummaries,
+    mergedClassification
+  };
+  return {
+    turns,
+    turnSummaries,
+    rawTurnClassifications,
+    mergedClassificationRaw,
+    payload,
+    input: { thread: payload.thread, turnSummaries, mergedClassification, rawTurnClassificationCount: rawTurnClassifications.length }
+  };
+}
+
+function buildMergeThreadTurnsPrompt(payload) {
+  return renderPromptTemplate("ai.merge_thread_turns", {
+    payloadJson: JSON.stringify(payload, null, 2)
+  });
+}
+
+function buildMergeThreadTurnsAiMeta(runtime, baseMeta, payload, strategy) {
+  const prompt = buildMergeThreadTurnsPrompt(payload);
+  return {
+    ...baseMeta,
+    prompt,
+    input: { payload, strategy },
+    inputHash: hashJson({ payload, strategy }),
+    promptHash: hashText(prompt),
+    promptPreview: clip(prompt.replace(/\s+/g, " "), 220)
+  };
+}
+
+function splitThreadMergeSummaries(runtime, context, summaries, tokenLimit, chunkSize) {
+  const chunks = [];
+  let current = [];
+  for (const summary of summaries) {
+    const candidate = [...current, summary];
+    const payload = { ...context.payload, turnSummaries: candidate };
+    const prompt = buildMergeThreadTurnsPrompt(payload);
+    const estimatedInputTokens = buildPromptStats({ prompt, systemPrompt: getOllamaSystemPrompt(runtime.config) }).estimatedInputTokens;
+    if (current.length > 0 && (candidate.length > chunkSize || estimatedInputTokens > tokenLimit)) {
+      chunks.push(current);
+      current = [summary];
+      continue;
+    }
+    current = candidate;
+  }
+  if (current.length) {
+    chunks.push(current);
+  }
+  return chunks;
+}
+
+function compactPartialThreadSummaryForMerge(summary, level, chunkNumber) {
+  return {
+    turnIndex: null,
+    date: null,
+    userIntent: clip(summary?.summaryTitle || `partial summary L${level}-${chunkNumber}`, 240),
+    assistantResponse: clip(summary?.narrative || "", 500),
+    outcome: clip(Array.isArray(summary?.outcomes) ? summary.outcomes.join(" / ") : "", 360),
+    interests: Array.isArray(summary?.interests) ? summary.interests.slice(0, 8) : [],
+    questions: Array.isArray(summary?.questions) ? summary.questions.slice(0, 8) : []
+  };
+}
+
+function threadMergeInputTokenLimit(runtime) {
+  return Number(runtime.config.threadMergeInputTokenLimit || 15000);
+}
+
+function threadMergeChunkSize(runtime) {
+  return Number(runtime.config.threadMergeChunkSize || 20);
 }
 
 async function handleCategories(runtime, meta) {
@@ -2037,32 +2563,115 @@ async function handleRewriteEntry(runtime, itemId, meta) {
   return [`artifacts/ai/diary_entries/${itemId}.json`, `artifacts/raw/ai.rewrite_diary_entry/${itemId}.raw.json`];
 }
 
+async function handleWriteWeeklySummary(runtime, itemId, meta) {
+  const response = await askForJson(runtime, "ai.write_weekly_summary", itemId, `weekly-summary-${itemId}`, meta);
+  const weekInput = readWeekInput(runtime, itemId);
+  writeArtifact(runtime, `artifacts/ai/weekly_summaries/${itemId}.json`, {
+    schemaVersion: 1,
+    generatedAt: isoJst(),
+    runId: runtime.config.runId,
+    itemId,
+    week: weekInput.week,
+    entryIds: weekInput.entries.map((entry) => entry.itemId),
+    stats: weekInput.stats,
+    title: response.parsed.title || `${weekInput.week} の日記`,
+    overview: response.parsed.overview || "",
+    themes: Array.isArray(response.parsed.themes) ? response.parsed.themes : [],
+    notableDays: Array.isArray(response.parsed.notableDays) ? response.parsed.notableDays : [],
+    closing: response.parsed.closing || "",
+    aiMeta: buildAiMeta(runtime, meta, response)
+  });
+  writeRaw(runtime, "ai.write_weekly_summary", itemId, response.text, response.usage);
+  return [`artifacts/ai/weekly_summaries/${itemId}.json`, `artifacts/raw/ai.write_weekly_summary/${itemId}.raw.json`];
+}
+
+async function handleWriteMonthlySummary(runtime, itemId, meta) {
+  const response = await askForJson(runtime, "ai.write_monthly_summary", itemId, `monthly-summary-${itemId}`, meta);
+  const monthInput = readMonthInput(runtime, itemId);
+  writeArtifact(runtime, `artifacts/ai/monthly_summaries/${itemId}.json`, {
+    schemaVersion: 1,
+    generatedAt: isoJst(),
+    runId: runtime.config.runId,
+    itemId,
+    month: monthInput.month,
+    weekIds: monthInput.weeks.map((week) => `week_${week}`),
+    entryIds: monthInput.entries.map((entry) => entry.itemId),
+    stats: monthInput.stats,
+    title: response.parsed.title || `${monthInput.month} の日記`,
+    overview: response.parsed.overview || "",
+    themes: Array.isArray(response.parsed.themes) ? response.parsed.themes : [],
+    notableWeeks: Array.isArray(response.parsed.notableWeeks) ? response.parsed.notableWeeks : [],
+    closing: response.parsed.closing || "",
+    aiMeta: buildAiMeta(runtime, meta, response)
+  });
+  writeRaw(runtime, "ai.write_monthly_summary", itemId, response.text, response.usage);
+  return [`artifacts/ai/monthly_summaries/${itemId}.json`, `artifacts/raw/ai.write_monthly_summary/${itemId}.raw.json`];
+}
+
+async function handleWriteYearlySummary(runtime, itemId, meta) {
+  const response = await askForJson(runtime, "ai.write_yearly_summary", itemId, `yearly-summary-${itemId}`, meta);
+  const yearInput = readYearInput(runtime, itemId);
+  writeArtifact(runtime, `artifacts/ai/yearly_summaries/${itemId}.json`, {
+    schemaVersion: 1,
+    generatedAt: isoJst(),
+    runId: runtime.config.runId,
+    itemId,
+    year: yearInput.year,
+    monthIds: yearInput.months.map((month) => `month_${month}`),
+    stats: yearInput.stats,
+    title: response.parsed.title || `${yearInput.year} 年の日記`,
+    overview: response.parsed.overview || "",
+    themes: Array.isArray(response.parsed.themes) ? response.parsed.themes : [],
+    notableMonths: Array.isArray(response.parsed.notableMonths) ? response.parsed.notableMonths : [],
+    closing: response.parsed.closing || "",
+    aiMeta: buildAiMeta(runtime, meta, response)
+  });
+  writeRaw(runtime, "ai.write_yearly_summary", itemId, response.text, response.usage);
+  return [`artifacts/ai/yearly_summaries/${itemId}.json`, `artifacts/raw/ai.write_yearly_summary/${itemId}.raw.json`];
+}
+
 function handleRenderMarkdown(runtime) {
   const entries = loadDiaryEntries(runtime).sort((a, b) => (a.date || "").localeCompare(b.date || "", "ja"));
   const posts = writeRenderPostsMarkdown(runtime, entries);
-  writeArtifact(runtime, "artifacts/render/diary.json", { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, grouping: runtime.config.grouping, entries, posts });
+  const archives = writeRenderArchivesMarkdown(runtime, posts);
+  writeArtifact(runtime, "artifacts/render/diary.json", { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, grouping: runtime.config.grouping, entries, posts, weeks: archives.weeks, months: archives.months, years: archives.years });
   writeArtifact(runtime, "artifacts/render/posts.json", { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, posts });
+  writeArtifact(runtime, "artifacts/render/weeks.json", { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, weeks: archives.weeks });
+  writeArtifact(runtime, "artifacts/render/months.json", { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, months: archives.months });
+  writeArtifact(runtime, "artifacts/render/years.json", { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, years: archives.years });
   const markdown = ["# Nikki Diary", "", `- 生成日時: ${isoJst()}`, `- 集計単位: ${runtime.config.grouping}`, "", ...entries.flatMap((entry) => [`## ${entry.title || entry.itemId}`, "", entry.date ? `- 日付: ${entry.date}` : "", entry.date ? "" : "", entry.markdownBody || "", ""])].join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
   fs.writeFileSync(path.join(runtime.paths.root, "artifacts", "render", "diary.md"), markdown, "utf8");
-  const indexMarkdown = buildRenderIndexMarkdown(posts);
+  const indexMarkdown = buildRenderIndexMarkdown(posts, archives.weeks, archives.months, archives.years);
   fs.writeFileSync(path.join(runtime.paths.root, "artifacts", "render", "index.md"), indexMarkdown, "utf8");
-  return ["artifacts/render/diary.json", "artifacts/render/posts.json", "artifacts/render/diary.md", "artifacts/render/index.md", ...posts.map((post) => post.markdownPath)];
+  return ["artifacts/render/diary.json", "artifacts/render/posts.json", "artifacts/render/weeks.json", "artifacts/render/months.json", "artifacts/render/years.json", "artifacts/render/diary.md", "artifacts/render/index.md", ...posts.map((post) => post.markdownPath), ...archives.weeks.map((week) => week.markdownPath), ...archives.months.map((month) => month.markdownPath), ...archives.years.map((year) => year.markdownPath)];
 }
 
 function handleRenderHtml(runtime) {
   const markdown = fs.readFileSync(path.join(runtime.paths.root, "artifacts", "render", "diary.md"), "utf8");
   fs.writeFileSync(path.join(runtime.paths.root, "artifacts", "render", "diary.html"), wrapHtml(marked.parse(markdown)), "utf8");
   const posts = readArtifact(runtime, "artifacts/render/posts.json")?.posts || [];
+  const weeks = readArtifact(runtime, "artifacts/render/weeks.json")?.weeks || [];
+  const months = readArtifact(runtime, "artifacts/render/months.json")?.months || [];
+  const years = readArtifact(runtime, "artifacts/render/years.json")?.years || [];
   const changedEntryIds = getChangedEntryIds(runtime);
-  fs.writeFileSync(path.join(runtime.paths.root, "artifacts", "render", "index.html"), wrapBlogIndexHtml(posts), "utf8");
+  fs.writeFileSync(path.join(runtime.paths.root, "artifacts", "render", "index.html"), wrapBlogIndexHtml(posts, weeks, months, years), "utf8");
   for (const post of posts) {
     if (changedEntryIds.size > 0 && !changedEntryIds.has(post.entryId) && fs.existsSync(path.join(runtime.paths.root, post.htmlPath))) {
       continue;
     }
     const entry = readArtifact(runtime, `artifacts/ai/diary_entries/${post.entryId}.json`) || {};
-    fs.writeFileSync(path.join(runtime.paths.root, post.htmlPath), wrapBlogPostHtml(post, entry, posts), "utf8");
+    fs.writeFileSync(path.join(runtime.paths.root, post.htmlPath), wrapBlogPostHtml(post, entry, posts, weeks, months, years), "utf8");
   }
-  return ["artifacts/render/diary.html", "artifacts/render/index.html", ...posts.map((post) => post.htmlPath)];
+  for (const week of weeks) {
+    fs.writeFileSync(path.join(runtime.paths.root, week.htmlPath), wrapBlogWeekHtml(week, posts, weeks, months, years), "utf8");
+  }
+  for (const month of months) {
+    fs.writeFileSync(path.join(runtime.paths.root, month.htmlPath), wrapBlogMonthHtml(month, posts, weeks, months, years), "utf8");
+  }
+  for (const year of years) {
+    fs.writeFileSync(path.join(runtime.paths.root, year.htmlPath), wrapBlogYearHtml(year, posts, weeks, months, years), "utf8");
+  }
+  return ["artifacts/render/diary.html", "artifacts/render/index.html", ...posts.map((post) => post.htmlPath), ...weeks.map((week) => week.htmlPath), ...months.map((month) => month.htmlPath), ...years.map((year) => year.htmlPath)];
 }
 
 async function handleRenderPdf(runtime) {
@@ -2151,6 +2760,7 @@ async function askForJson(runtime, taskKey, itemId, name, meta) {
       prompt,
       onProgress: (event) => {
         runtime.current.sentAt = event.sentAt || runtime.current.sentAt;
+        runtime.current.promptStats = event.promptStats || runtime.current.promptStats;
         if (event.phase === "thinking" && event.thinkingText) {
           logThinkingConsole(taskKey, itemId, event.thinkingText);
         }
@@ -2160,7 +2770,7 @@ async function askForJson(runtime, taskKey, itemId, name, meta) {
         if (event.phase === "turn-start") {
           logTaskProgressConsole(runtime);
         }
-        writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: event.promptPreview || runtime.current.promptPreview, sentAt: event.sentAt || runtime.current.sentAt, note: event.note || null, lastEvent: `ai.${event.phase || "progress"}` });
+        writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: event.promptPreview || runtime.current.promptPreview, promptStats: event.promptStats || runtime.current.promptStats, sentAt: event.sentAt || runtime.current.sentAt, note: event.note || null, lastEvent: `ai.${event.phase || "progress"}` });
       }
     })).catch((error) => {
       throw normalizeAiFailure(error);
@@ -2220,7 +2830,8 @@ async function runAiWithRetry(runtime, taskKey, itemId, run) {
         throw error;
       }
       const delayMs = Math.min(1000 * (2 ** (attempt - 1)), 30000);
-      const note = `一時的な AI エラーのため ${delayMs}ms 後に再試行します (${attempt}/${maxAttempts})`;
+      const diagnostics = await collectAiRetryDiagnostics(error);
+      const note = `一時的な AI エラーのため ${delayMs}ms 後に再試行します (${attempt}/${maxAttempts}) 理由=${summarizeAiRetryError(error)}${diagnostics ? ` ${diagnostics}` : ""}`;
       emitEvent(runtime, { type: "task.retry_scheduled", stage: runtime.current.stage, taskKey, itemType: runtime.current.itemType, itemId, taskInstanceId: runtime.current.taskInstanceId, note });
       logConsole("retry", runtime.current.taskInstanceId, note);
       writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: runtime.current.promptPreview, sentAt: runtime.current.sentAt, note, lastEvent: "task.retry_scheduled" });
@@ -2255,6 +2866,90 @@ function isRetryableAiText(text) {
 function isRetryableAiFailure(error) {
   const message = error instanceof Error ? error.message : String(error);
   return /(429|rate limit|temporar|timeout|ECONNRESET|socket hang up|service unavailable|too many requests|invalid_request_body|fetch failed|internal error|-32603|同一行を繰り返したため中断しました)/i.test(message);
+}
+
+function summarizeAiRetryError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const normalized = String(message || "").replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return "詳細不明";
+  }
+  if (/Ollama 応答がタイムアウトしました|UND_ERR_HEADERS_TIMEOUT|Headers Timeout Error/i.test(normalized)) {
+    return clip(normalized, 220);
+  }
+  if (/Ollama への接続に失敗しました|fetch failed|ECONNREFUSED|ECONNRESET|socket hang up/i.test(normalized)) {
+    return clip(normalized, 220);
+  }
+  if (/同一行を繰り返したため中断しました/i.test(normalized)) {
+    return clip(normalized, 220);
+  }
+  if (/invalid_request_body|internal error|-32603|service unavailable|too many requests|rate limit|429/i.test(normalized)) {
+    return clip(normalized, 220);
+  }
+  return clip(normalized, 220);
+}
+
+async function collectAiRetryDiagnostics(error) {
+  if (!isOllamaTimeoutRetryError(error)) {
+    return "";
+  }
+  return formatOllamaCpuSnapshot(await sampleOllamaCpuUsage());
+}
+
+function isOllamaTimeoutRetryError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /Ollama 応答がタイムアウトしました|UND_ERR_HEADERS_TIMEOUT|Headers Timeout Error|UND_ERR_BODY_TIMEOUT|Body Timeout Error/i.test(message);
+}
+
+async function sampleOllamaCpuUsage() {
+  const script = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    "$cores = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors",
+    "$p1 = Get-Process -Name ollama -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, CPU",
+    "Start-Sleep -Milliseconds 1000",
+    "$p2 = Get-Process -Name ollama -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, CPU, WorkingSet64",
+    "$result = @()",
+    "foreach ($b in $p2) {",
+    "  $a = $p1 | Where-Object { $_.Id -eq $b.Id } | Select-Object -First 1",
+    "  $delta = $null",
+    "  if ($a -and $null -ne $a.CPU -and $null -ne $b.CPU) { $delta = $b.CPU - $a.CPU }",
+    "  $cpu = $null",
+    "  if ($null -ne $delta -and $cores) { $cpu = [math]::Round(($delta / 1.0 / $cores) * 100, 1) }",
+    "  $mem = $null",
+    "  if ($null -ne $b.WorkingSet64) { $mem = [math]::Round($b.WorkingSet64 / 1MB, 1) }",
+    "  $result += [pscustomobject]@{ pid = $b.Id; name = $b.ProcessName; cpuPercent = $cpu; workingSetMB = $mem }",
+    "}",
+    "$result | ConvertTo-Json -Compress"
+  ].join("; ");
+  try {
+    const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], { windowsHide: true, timeout: 5000, maxBuffer: 1024 * 1024 });
+    const text = String(stdout || "").trim();
+    if (!text) {
+      return [];
+    }
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch {
+    return null;
+  }
+}
+
+function formatOllamaCpuSnapshot(snapshot) {
+  if (snapshot === null) {
+    return "ollamaCpu=取得失敗";
+  }
+  if (!Array.isArray(snapshot) || snapshot.length === 0) {
+    return "ollamaCpu=processなし";
+  }
+  const details = snapshot
+    .map((process) => {
+      const pid = process?.pid ?? "-";
+      const cpu = Number.isFinite(Number(process?.cpuPercent)) ? `${Number(process.cpuPercent).toFixed(1)}%` : "-";
+      const mem = Number.isFinite(Number(process?.workingSetMB)) ? `${Number(process.workingSetMB).toFixed(1)}MB` : "-";
+      return `pid=${pid} cpu=${cpu} mem=${mem}`;
+    })
+    .join("; ");
+  return `ollamaCpu=${details}`;
 }
 
 function isContextOverflowFailure(error) {
@@ -2459,6 +3154,7 @@ function writeRaw(runtime, taskKey, itemId, text, usage = null) {
 function writeParseError(runtime, taskKey, itemId, value) { writeArtifact(runtime, `artifacts/raw/${taskKey}/${itemId}.parse-error.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, taskKey, itemId, ...value }); }
 function readUnit(runtime, itemId) { const item = (readArtifact(runtime, "artifacts/units/units.json")?.items || []).find((candidate) => candidate.itemId === itemId); if (!item) throw new Error(`unit が見つかりません: ${itemId}`); return item; }
 function readEntry(runtime, itemId) { const units = (readArtifact(runtime, "artifacts/units/units.json")?.items || []).filter((unit) => unit.entryId === itemId); if (!units.length) throw new Error(`entry が見つかりません: ${itemId}`); return { itemId, date: units[0].date || itemId.replace(/^entry_/, ""), units, unitSummaries: units.map((unit) => readArtifact(runtime, `artifacts/ai/unit_summaries/${unit.itemId}.json`)).filter(Boolean) }; }
+function readThread(runtime, itemId) { const item = readArtifact(runtime, `artifacts/normalized/${itemId}.json`); if (!item) throw new Error(`thread が見つかりません: ${itemId}`); return item; }
 function readTurn(runtime, itemId) { const item = readArtifact(runtime, `artifacts/turns/${itemId}.json`); if (!item) throw new Error(`turn が見つかりません: ${itemId}`); return item; }
 function loadThreads(runtime) { return (readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || []).map((thread) => readArtifact(runtime, `artifacts/normalized/${thread.itemId}.json`)).filter(Boolean); }
 function loadScopedThreads(runtime) {
@@ -2475,8 +3171,18 @@ function loadScopedThreadIndex(runtime) {
   }
   return threads.filter((thread) => threadMatchesTargetScopes(thread, runtime.config));
 }
-function loadTurns(runtime) { return (readArtifact(runtime, "artifacts/indexes/turn-index.json")?.turns || []).map((turn) => readArtifact(runtime, `artifacts/turns/${turn.itemId}.json`)).filter(Boolean); }
+function loadTurns(runtime) {
+  return (readArtifact(runtime, "artifacts/indexes/turn-index.json")?.turns || [])
+    .filter((turn) => isNonEmptyTurnItem(runtime, turn));
+}
 function loadTurnsForThread(runtime, threadItemId) { return loadTurns(runtime).filter((turn) => turn.threadItemId === threadItemId); }
+function isNonEmptyTurnItem(runtime, turnMeta) {
+  const turn = readArtifact(runtime, `artifacts/turns/${turnMeta.itemId}.json`);
+  if (!turn) {
+    return false;
+  }
+  return isNonEmptyTurnGroup(turn);
+}
 function hasThreadSummaryInputs(runtime, threadItemId) {
   return Boolean(
     readArtifact(runtime, `artifacts/ai/thread_classification/${threadItemId}.json`)
@@ -2593,6 +3299,9 @@ function monthWeekKey(date) {
   return `${anchorYear}-${String(anchorMonth).padStart(2, "0")}-W${weekOfMonth}`;
 }
 function loadDiaryEntries(runtime) { const entryIds = [...new Set((readArtifact(runtime, "artifacts/units/units.json")?.items || []).map((unit) => unit.entryId).filter(Boolean))]; return entryIds.map((entryId) => readArtifact(runtime, `artifacts/ai/diary_entries/${entryId}.json`)).filter(Boolean); }
+function loadWeeklySummaries(runtime) { return enumerateWeekItems(runtime).map((item) => readArtifact(runtime, `artifacts/ai/weekly_summaries/${item.itemId}.json`)).filter(Boolean); }
+function loadMonthlySummaries(runtime) { return enumerateMonthItems(runtime).map((item) => readArtifact(runtime, `artifacts/ai/monthly_summaries/${item.itemId}.json`)).filter(Boolean); }
+function loadYearlySummaries(runtime) { return enumerateYearItems(runtime).map((item) => readArtifact(runtime, `artifacts/ai/yearly_summaries/${item.itemId}.json`)).filter(Boolean); }
 function getChangedEntryIds(runtime) {
   const changed = new Set();
   for (const instanceId of runtime.changed || []) {
@@ -2667,11 +3376,296 @@ function writeRenderPostsMarkdown(runtime, entries) {
     });
     return posts;
   }
-function buildRenderIndexMarkdown(posts) {
+function threadItemIdsForEntry(runtime, entryId) {
+  return (readArtifact(runtime, "artifacts/units/units.json")?.items || [])
+    .filter((unit) => unit.entryId === entryId)
+    .flatMap((unit) => unit.threadItemIds || []);
+}
+function buildArchiveStatsFromEntries(runtime, entries, options = {}) {
+  const categoryMap = new Map((readCategoryMaster(runtime)?.categories || []).map((category) => [category.id, category.label]));
+  const posts = (entries || []).map((entry) => {
+    const threadItemIds = threadItemIdsForEntry(runtime, entry.itemId);
+    return {
+      entryId: entry.itemId,
+      date: entry.date || null,
+      categories: buildRenderPostCategories(runtime, threadItemIds, categoryMap),
+      threads: buildRenderPostThreads(runtime, threadItemIds, categoryMap)
+    };
+  });
+  return buildArchiveStats(runtime, posts, options);
+}
+function buildArchiveStats(runtime, posts, options = {}) {
+  const threadIndex = new Map((readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || []).map((thread) => [thread.itemId, thread]));
+  const uniqueThreads = new Map();
+  const categoryCounts = new Map();
+  const primaryCategoryCounts = new Map();
+  const days = new Set();
+  for (const post of posts || []) {
+    if (post.date) {
+      days.add(post.date);
+    }
+    for (const category of post.categories || []) {
+      incrementCategoryCount(categoryCounts, category);
+    }
+    for (const thread of post.threads || []) {
+      if (!thread?.itemId || uniqueThreads.has(thread.itemId)) {
+        continue;
+      }
+      const indexed = threadIndex.get(thread.itemId) || {};
+      uniqueThreads.set(thread.itemId, { ...indexed, ...thread });
+      if (thread.categoryId) {
+        incrementCategoryCount(primaryCategoryCounts, { id: thread.categoryId, label: thread.categoryLabel || thread.categoryId });
+      }
+    }
+  }
+  const threadValues = [...uniqueThreads.values()];
+  const tokenEstimate = estimateArchiveConversationTokens(runtime, threadValues);
+  return {
+    dayCount: days.size || (posts || []).length,
+    weekCount: Number(options.weekCount || 0),
+    monthCount: Number(options.monthCount || 0),
+    threadCount: threadValues.length,
+    messageCount: sumThreadMetric(threadValues, "messageCount"),
+    userMessageCount: sumThreadMetric(threadValues, "userMessageCount"),
+    assistantMessageCount: sumThreadMetric(threadValues, "assistantMessageCount"),
+    estimatedInputTokens: tokenEstimate.inputTokens,
+    estimatedOutputTokens: tokenEstimate.outputTokens,
+    estimatedTotalTokens: tokenEstimate.inputTokens + tokenEstimate.outputTokens,
+    generatedImageCount: sumThreadMetric(threadValues, "generatedImageCount"),
+    topCategories: sortCategoryCounts(categoryCounts),
+    topPrimaryCategories: sortCategoryCounts(primaryCategoryCounts)
+  };
+}
+function estimateArchiveConversationTokens(runtime, threads) {
+  let inputTokens = 0;
+  let outputTokens = 0;
+  for (const thread of threads || []) {
+    const normalized = readArtifact(runtime, `artifacts/normalized/${thread.itemId}.json`) || {};
+    for (const message of normalized.messages || []) {
+      const tokens = estimateInputTokens(message?.text || "");
+      if (message?.role === "user") {
+        inputTokens += tokens;
+      } else if (message?.role === "assistant") {
+        outputTokens += tokens;
+      }
+    }
+  }
+  return { inputTokens, outputTokens };
+}
+function incrementCategoryCount(map, category) {
+  const id = category?.id || category?.categoryId || "uncategorized";
+  const label = category?.label || category?.categoryLabel || id;
+  if (!map.has(id)) {
+    map.set(id, { id, label, count: 0 });
+  }
+  map.get(id).count += 1;
+}
+function sortCategoryCounts(map) {
+  return [...map.values()].sort((left, right) => right.count - left.count || left.label.localeCompare(right.label, "ja"));
+}
+function sumThreadMetric(threads, key) {
+  return (threads || []).reduce((sum, thread) => sum + Number(thread?.[key] || 0), 0);
+}
+function writeRenderArchivesMarkdown(runtime, posts) {
+  const weeksDir = path.join(runtime.paths.root, "artifacts", "render", "weeks");
+  const monthsDir = path.join(runtime.paths.root, "artifacts", "render", "months");
+  const yearsDir = path.join(runtime.paths.root, "artifacts", "render", "years");
+  ensureDir(weeksDir);
+  ensureDir(monthsDir);
+  ensureDir(yearsDir);
+  const weeks = buildRenderWeeks(runtime, posts);
+  const months = buildRenderMonths(runtime, weeks);
+  const years = buildRenderYears(runtime, months);
+  for (const week of weeks) {
+    fs.writeFileSync(path.join(runtime.paths.root, week.markdownPath), buildRenderWeekMarkdown(week), "utf8");
+  }
+  for (const month of months) {
+    fs.writeFileSync(path.join(runtime.paths.root, month.markdownPath), buildRenderMonthMarkdown(month), "utf8");
+  }
+  for (const year of years) {
+    fs.writeFileSync(path.join(runtime.paths.root, year.markdownPath), buildRenderYearMarkdown(year), "utf8");
+  }
+  return { weeks, months, years };
+}
+function buildRenderWeeks(runtime, posts) {
+  const buckets = new Map();
+  for (const post of posts || []) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(post.date || ""))) {
+      continue;
+    }
+    const weekId = monthWeekKey(post.date);
+    if (!weekId) {
+      continue;
+    }
+    if (!buckets.has(weekId)) {
+      buckets.set(weekId, { itemId: `week_${weekId}`, week: weekId, month: weekId.slice(0, 7), title: `${weekId} の日記`, markdownPath: `artifacts/render/weeks/${weekId}.md`, htmlPath: `artifacts/render/weeks/${weekId}.html`, posts: [] });
+    }
+    buckets.get(weekId).posts.push(post);
+  }
+  return [...buckets.values()]
+    .map((week) => {
+      const sortedPosts = week.posts.sort((a, b) => (a.date || "").localeCompare(b.date || "", "ja"));
+      return { ...week, summary: readArtifact(runtime, `artifacts/ai/weekly_summaries/${week.itemId}.json`) || null, stats: buildArchiveStats(runtime, sortedPosts, { weekCount: 1 }), posts: sortedPosts };
+    })
+    .sort((a, b) => a.week.localeCompare(b.week, "ja"));
+}
+function buildRenderMonths(runtime, weeks) {
+  const buckets = new Map();
+  for (const week of weeks || []) {
+    const monthId = week.month || week.week.slice(0, 7);
+    if (!buckets.has(monthId)) {
+      buckets.set(monthId, { itemId: `month_${monthId}`, month: monthId, title: `${monthId} の日記`, markdownPath: `artifacts/render/months/${monthId}.md`, htmlPath: `artifacts/render/months/${monthId}.html`, weeks: [], posts: [] });
+    }
+    buckets.get(monthId).weeks.push(week);
+    buckets.get(monthId).posts.push(...(week.posts || []));
+  }
+  return [...buckets.values()]
+    .map((month) => {
+      const sortedWeeks = month.weeks.sort((a, b) => a.week.localeCompare(b.week, "ja"));
+      const sortedPosts = month.posts.sort((a, b) => (a.date || "").localeCompare(b.date || "", "ja"));
+      return { ...month, summary: readArtifact(runtime, `artifacts/ai/monthly_summaries/${month.itemId}.json`) || null, stats: buildArchiveStats(runtime, sortedPosts, { monthCount: 1, weekCount: sortedWeeks.length }), weeks: sortedWeeks, posts: sortedPosts };
+    })
+    .sort((a, b) => a.month.localeCompare(b.month, "ja"));
+}
+function buildRenderYears(runtime, months) {
+  const buckets = new Map();
+  for (const month of months || []) {
+    const yearId = month.month.slice(0, 4);
+    if (!buckets.has(yearId)) {
+      buckets.set(yearId, { itemId: `year_${yearId}`, year: yearId, title: `${yearId} 年の日記`, markdownPath: `artifacts/render/years/${yearId}.md`, htmlPath: `artifacts/render/years/${yearId}.html`, months: [], postCount: 0 });
+    }
+    buckets.get(yearId).months.push(month);
+    buckets.get(yearId).postCount += month.posts.length;
+  }
+  return [...buckets.values()]
+    .map((year) => {
+      const sortedMonths = year.months.sort((a, b) => a.month.localeCompare(b.month, "ja"));
+      return { ...year, summary: readArtifact(runtime, `artifacts/ai/yearly_summaries/${year.itemId}.json`) || null, stats: buildArchiveStats(runtime, sortedMonths.flatMap((month) => month.posts || []), { weekCount: sortedMonths.reduce((sum, month) => sum + (month.weeks?.length || 0), 0), monthCount: sortedMonths.length }), months: sortedMonths };
+    })
+    .sort((a, b) => a.year.localeCompare(b.year, "ja"));
+}
+function buildRenderWeekMarkdown(week) {
+  const summary = week.summary ? buildWeeklySummaryMarkdown(week.summary) : "";
+  const stats = buildArchiveStatsMarkdown(week.stats);
+  return [
+    `# ${week.summary?.title || week.title}`,
+    "",
+    `- 週: ${week.week}`,
+    `- 日数: ${week.posts.length}`,
+    "",
+    stats,
+    stats ? "" : null,
+    summary,
+    summary ? "" : null,
+    "## 日別",
+    "",
+    ...week.posts.map((post) => `- [${post.date || "unknown"} | ${post.title}](../posts/${path.posix.basename(post.htmlPath)})`)
+  ].filter((line) => line !== null).join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
+}
+function buildRenderMonthMarkdown(month) {
+  const summary = month.summary ? buildMonthlySummaryMarkdown(month.summary) : "";
+  const stats = buildArchiveStatsMarkdown(month.stats);
+  return [
+    `# ${month.summary?.title || month.title}`,
+    "",
+    `- 日数: ${month.posts.length}`,
+    "",
+    stats,
+    stats ? "" : null,
+    summary,
+    summary ? "" : null,
+    "## 週別",
+    "",
+    ...month.weeks.map((week) => `- [${week.week} (${week.posts.length}日)](../weeks/${path.posix.basename(week.htmlPath)})`)
+  ].filter((line) => line !== null).join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
+}
+function buildRenderYearMarkdown(year) {
+  const summary = year.summary ? buildYearlySummaryMarkdown(year.summary) : "";
+  const stats = buildArchiveStatsMarkdown(year.stats);
+  return [
+    `# ${year.summary?.title || year.title}`,
+    "",
+    `- 月数: ${year.months.length}`,
+    `- 日数: ${year.postCount}`,
+    "",
+    stats,
+    stats ? "" : null,
+    summary,
+    summary ? "" : null,
+    ...year.months.map((month) => `- [${month.month} (${month.posts.length}日)](../months/${path.posix.basename(month.htmlPath)})`)
+  ].filter((line) => line !== null).join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
+}
+function buildArchiveStatsMarkdown(stats) {
+  if (!stats) {
+    return "";
+  }
+  return [
+    "## 統計",
+    "",
+    `- 日数: ${stats.dayCount}`,
+    stats.weekCount ? `- 週数: ${stats.weekCount}` : null,
+    stats.monthCount ? `- 月数: ${stats.monthCount}` : null,
+    `- スレッド数: ${stats.threadCount}`,
+    `- メッセージ数: ${stats.messageCount}`,
+    `- ユーザー発話数: ${stats.userMessageCount}`,
+    `- アシスタント発話数: ${stats.assistantMessageCount}`,
+    `- 推定入力トークン数: ${formatInteger(stats.estimatedInputTokens)}`,
+    `- 推定出力トークン数: ${formatInteger(stats.estimatedOutputTokens)}`,
+    `- 推定合計トークン数: ${formatInteger(stats.estimatedTotalTokens)}`,
+    `- 生成画像数: ${stats.generatedImageCount}`,
+    stats.topCategories?.length ? `- 多かった話題: ${stats.topCategories.slice(0, 8).map((category) => `${category.label} (${category.count})`).join("、")}` : null,
+    stats.topPrimaryCategories?.length ? `- 主話題: ${stats.topPrimaryCategories.slice(0, 8).map((category) => `${category.label} (${category.count})`).join("、")}` : null
+  ].filter(Boolean).join("\n");
+}
+function buildWeeklySummaryMarkdown(summary) {
+  return [
+    summary.overview || "",
+    ...(summary.themes || []).flatMap((theme) => [theme.heading ? `## ${theme.heading}` : "", theme.body || "", ""]),
+    summary.notableDays?.length ? "## 印象に残った日" : "",
+    ...(summary.notableDays || []).map((day) => `- ${day.date || "unknown"}: ${day.title || ""}${day.note ? ` - ${day.note}` : ""}`),
+    summary.closing ? "" : null,
+    summary.closing || ""
+  ].filter(Boolean).join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+function buildMonthlySummaryMarkdown(summary) {
+  return [
+    summary.overview || "",
+    ...(summary.themes || []).flatMap((theme) => [theme.heading ? `## ${theme.heading}` : "", theme.body || "", ""]),
+    summary.notableWeeks?.length ? "## 印象に残った週" : "",
+    ...(summary.notableWeeks || []).map((week) => `- ${week.week || "unknown"}: ${week.title || ""}${week.note ? ` - ${week.note}` : ""}`),
+    summary.closing ? "" : null,
+    summary.closing || ""
+  ].filter(Boolean).join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+function buildYearlySummaryMarkdown(summary) {
+  return [
+    summary.overview || "",
+    ...(summary.themes || []).flatMap((theme) => [theme.heading ? `## ${theme.heading}` : "", theme.body || "", ""]),
+    summary.notableMonths?.length ? "## 印象に残った月" : "",
+    ...(summary.notableMonths || []).map((month) => `- ${month.month || "unknown"}: ${month.title || ""}${month.note ? ` - ${month.note}` : ""}`),
+    summary.closing ? "" : null,
+    summary.closing || ""
+  ].filter(Boolean).join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+function buildRenderIndexMarkdown(posts, weeks = [], months = [], years = []) {
   return [
     "# Nikki Blog",
     "",
     `- 生成日時: ${isoJst()}`,
+    "",
+    "## 年別",
+    "",
+    ...years.map((year) => `- [${year.year} (${year.postCount}日)](./years/${path.posix.basename(year.htmlPath)})`),
+    "",
+    "## 月別",
+    "",
+    ...months.map((month) => `- [${month.month} (${month.posts.length}日)](./months/${path.posix.basename(month.htmlPath)})`),
+    "",
+    "## 週別",
+    "",
+    ...weeks.map((week) => `- [${week.week} (${week.posts.length}日)](./weeks/${path.posix.basename(week.htmlPath)})`),
+    "",
+    "## 日別",
     "",
     ...posts.map((post) => `- [${post.date || "unknown"} | ${post.title}](./posts/${path.posix.basename(post.htmlPath)})`)
   ].join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
@@ -2744,16 +3738,31 @@ function buildRenderIndexMarkdown(posts) {
     .replaceAll("\"", "&quot;")
     .replaceAll("'", "&#39;");
 }
-function buildBlogSidebarHtml(posts, currentSlug = null) {
+function archiveHrefFromContext(relativePath, currentKind) {
+  if (currentKind === "post" || currentKind === "week" || currentKind === "month" || currentKind === "year") {
+    return `../${relativePath}`;
+  }
+  return `./${relativePath}`;
+}
+function buildBlogSidebarHtml(posts, currentSlug = null, weeks = [], months = [], years = [], currentKind = "index") {
   return [
     `<aside class="blog-sidebar">`,
     `<div class="blog-sidebar-panel">`,
     `<h1>Nikki Blog</h1>`,
     `<p class="blog-sidebar-meta">生成日時: ${escapeHtml(isoJst())}</p>`,
+    years.length ? `<nav class="blog-archive-nav"><h2>年別</h2><ul>` : "",
+    ...years.map((year) => `<li><a href="${escapeHtml(archiveHrefFromContext(year.htmlPath.replace(/^artifacts\/render\//, ""), currentKind))}"><span class="blog-post-date">${escapeHtml(year.year)}</span><span class="blog-post-title">${year.postCount}日</span></a></li>`),
+    years.length ? `</ul></nav>` : "",
+    months.length ? `<nav class="blog-archive-nav"><h2>月別</h2><ul>` : "",
+    ...months.map((month) => `<li><a href="${escapeHtml(archiveHrefFromContext(month.htmlPath.replace(/^artifacts\/render\//, ""), currentKind))}"><span class="blog-post-date">${escapeHtml(month.month)}</span><span class="blog-post-title">${month.posts.length}日</span></a></li>`),
+    months.length ? `</ul></nav>` : "",
+    weeks.length ? `<nav class="blog-archive-nav"><h2>週別</h2><ul>` : "",
+    ...weeks.map((week) => `<li><a href="${escapeHtml(archiveHrefFromContext(week.htmlPath.replace(/^artifacts\/render\//, ""), currentKind))}"><span class="blog-post-date">${escapeHtml(week.week)}</span><span class="blog-post-title">${week.posts.length}日</span></a></li>`),
+    weeks.length ? `</ul></nav>` : "",
     `<nav class="blog-sidebar-nav"><ul>`,
     ...posts.map((post) => {
       const isCurrent = currentSlug && post.slug === currentSlug;
-      const href = currentSlug ? `${path.posix.basename(post.htmlPath)}` : `./posts/${path.posix.basename(post.htmlPath)}`;
+      const href = currentKind === "post" ? `${path.posix.basename(post.htmlPath)}` : archiveHrefFromContext(`posts/${path.posix.basename(post.htmlPath)}`, currentKind);
       return `<li class="${isCurrent ? "is-current" : ""}"><a href="${href}"><span class="blog-post-date">${escapeHtml(post.date || "unknown")}</span><span class="blog-post-title">${escapeHtml(post.title)}</span></a></li>`;
     }),
     `</ul></nav>`,
@@ -2793,19 +3802,19 @@ function buildBlogNavHtml(previousPost, nextPost) {
   return `<nav class="blog-post-nav">${links.join("<span class=\"sep\">|</span>")}</nav>`;
 }
 function wrapBlogLayoutHtml(sidebarHtml, contentHtml, taxonomyHtml, pageTitle) {
-  return `<!doctype html><html lang="ja"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>${escapeHtml(pageTitle)}</title><style>:root{--bg:#efe4d1;--panel:#fbf7f0;--ink:#1f1a17;--accent:#a54b2a;--line:#ddcdbd;--muted:#6f6257}*{box-sizing:border-box}body{margin:0;font-family:"Yu Mincho","Hiragino Mincho ProN",serif;color:var(--ink);background:radial-gradient(circle at top left,rgba(165,75,42,.12),transparent 24%),linear-gradient(180deg,#f5ede2 0%,#eadfcd 100%)}a{color:#5a45c6;text-decoration:underline}a:hover{text-decoration:none}.blog-layout{display:grid;grid-template-columns:320px minmax(0,1fr) 260px;gap:28px;max-width:1720px;margin:0 auto;padding:44px 28px 72px}.blog-sidebar,.blog-taxonomy{position:sticky;top:24px;align-self:start}.blog-sidebar-panel,.blog-content-panel,.blog-taxonomy-panel{background:var(--panel);border:1px solid var(--line);border-radius:24px;box-shadow:0 18px 42px rgba(53,37,24,.10)}.blog-sidebar-panel,.blog-taxonomy-panel{padding:34px 28px}.blog-sidebar-panel h1{margin:0 0 20px;font-size:3rem;line-height:1.05;border-bottom:2px solid var(--accent);padding-bottom:.4em}.blog-taxonomy-panel h2{margin:0 0 20px;font-size:2rem;line-height:1.1;border-bottom:2px solid var(--accent);padding-bottom:.4em}.blog-sidebar-meta{margin:0 0 24px;color:var(--muted);font-size:1rem;line-height:1.8}.blog-sidebar-nav ul,.blog-taxonomy-list{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:14px}.blog-sidebar-nav li a{display:flex;flex-direction:column;gap:3px;color:inherit;text-decoration:none;padding:10px 12px;border-radius:12px}.blog-sidebar-nav li a:hover,.blog-sidebar-nav li.is-current a,.blog-taxonomy-list li.is-current{background:rgba(165,75,42,.08)}.blog-post-date{font-size:.92rem;color:var(--accent)}.blog-post-title{font-size:1.05rem;line-height:1.6}.blog-main{min-width:0}.blog-content-panel{padding:28px 44px 40px}.blog-post-nav{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;align-items:center;margin:0 0 22px;font-size:1rem}.blog-post-nav.bottom{margin:28px 0 0}.blog-post-nav .sep{color:var(--muted)}.blog-post-nav .is-disabled{color:var(--muted)}.blog-article h1,.blog-index-copy h1{font-size:3rem;line-height:1.15;margin:0 0 20px;padding-bottom:.4em;border-bottom:2px solid var(--accent)}.blog-article h2,.blog-article h3{line-height:1.35;margin-top:2.2em}.blog-article p,.blog-article li,.blog-index-copy p,.blog-index-copy li{font-size:1.15rem;line-height:2}.blog-article ul,.blog-index-copy ul{padding-left:1.4em}.blog-meta{margin:0 0 20px;padding-left:1.2em}.blog-index-copy{min-height:70vh}.blog-taxonomy-list li{display:flex;justify-content:space-between;gap:12px;padding:10px 12px;border-radius:12px}.blog-taxonomy-label{line-height:1.5}.blog-taxonomy-count{color:var(--muted)}.blog-post-categories{margin-top:32px;padding-top:24px;border-top:1px solid var(--line)}.blog-post-categories h2{margin:0 0 16px;font-size:1.4rem}.blog-category-chips{display:flex;flex-wrap:wrap;gap:10px}.blog-category-chip{display:inline-flex;align-items:center;padding:8px 14px;border-radius:999px;background:rgba(165,75,42,.10);border:1px solid rgba(165,75,42,.18);font-size:1rem;color:var(--ink)}@media (max-width:1280px){.blog-layout{grid-template-columns:300px minmax(0,1fr)}.blog-taxonomy{position:static;grid-column:1 / -1}}@media (max-width:980px){.blog-layout{grid-template-columns:1fr;padding:20px 14px 40px}.blog-sidebar,.blog-taxonomy{position:static}.blog-sidebar-panel h1,.blog-article h1,.blog-index-copy h1{font-size:2.2rem}.blog-taxonomy-panel h2{font-size:1.8rem}.blog-content-panel{padding:22px 20px 28px}}</style></head><body><div class="blog-layout">${sidebarHtml}<main class="blog-main">${contentHtml}</main>${taxonomyHtml}</div></body></html>`;
+  return `<!doctype html><html lang="ja"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>${escapeHtml(pageTitle)}</title><style>:root{--bg:#efe4d1;--panel:#fbf7f0;--ink:#1f1a17;--accent:#a54b2a;--line:#ddcdbd;--muted:#6f6257}*{box-sizing:border-box}body{margin:0;font-family:"Yu Mincho","Hiragino Mincho ProN",serif;color:var(--ink);background:radial-gradient(circle at top left,rgba(165,75,42,.12),transparent 24%),linear-gradient(180deg,#f5ede2 0%,#eadfcd 100%)}a{color:#5a45c6;text-decoration:underline}a:hover{text-decoration:none}.blog-layout{display:grid;grid-template-columns:320px minmax(0,1fr) 260px;gap:28px;max-width:1720px;margin:0 auto;padding:44px 28px 72px}.blog-sidebar,.blog-taxonomy{position:sticky;top:24px;align-self:start}.blog-sidebar-panel,.blog-content-panel,.blog-taxonomy-panel{background:var(--panel);border:1px solid var(--line);border-radius:24px;box-shadow:0 18px 42px rgba(53,37,24,.10)}.blog-sidebar-panel,.blog-taxonomy-panel{padding:34px 28px}.blog-sidebar-panel h1{margin:0 0 20px;font-size:3rem;line-height:1.05;border-bottom:2px solid var(--accent);padding-bottom:.4em}.blog-sidebar-panel h2,.blog-taxonomy-panel h2{margin:0 0 12px;font-size:1.35rem;line-height:1.25;border-bottom:1px solid var(--line);padding-bottom:.35em}.blog-taxonomy-panel h2{margin-bottom:20px;font-size:2rem;line-height:1.1;border-bottom:2px solid var(--accent);padding-bottom:.4em}.blog-sidebar-meta{margin:0 0 24px;color:var(--muted);font-size:1rem;line-height:1.8}.blog-sidebar-nav ul,.blog-archive-nav ul,.blog-taxonomy-list{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:14px}.blog-archive-nav{margin:0 0 24px}.blog-sidebar-nav li a,.blog-archive-nav li a{display:flex;flex-direction:column;gap:3px;color:inherit;text-decoration:none;padding:10px 12px;border-radius:12px}.blog-sidebar-nav li a:hover,.blog-sidebar-nav li.is-current a,.blog-archive-nav li a:hover,.blog-taxonomy-list li.is-current{background:rgba(165,75,42,.08)}.blog-post-date{font-size:.92rem;color:var(--accent)}.blog-post-title{font-size:1.05rem;line-height:1.6}.blog-main{min-width:0}.blog-content-panel{padding:28px 44px 40px}.blog-post-nav{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;align-items:center;margin:0 0 22px;font-size:1rem}.blog-post-nav.bottom{margin:28px 0 0}.blog-post-nav .sep{color:var(--muted)}.blog-post-nav .is-disabled{color:var(--muted)}.blog-article h1,.blog-index-copy h1{font-size:3rem;line-height:1.15;margin:0 0 20px;padding-bottom:.4em;border-bottom:2px solid var(--accent)}.blog-article h2,.blog-article h3{line-height:1.35;margin-top:2.2em}.blog-article p,.blog-article li,.blog-index-copy p,.blog-index-copy li{font-size:1.15rem;line-height:2}.blog-article ul,.blog-index-copy ul{padding-left:1.4em}.blog-meta{margin:0 0 20px;padding-left:1.2em}.blog-index-copy{min-height:70vh}.blog-taxonomy-list li{display:flex;justify-content:space-between;gap:12px;padding:10px 12px;border-radius:12px}.blog-taxonomy-label{line-height:1.5}.blog-taxonomy-count{color:var(--muted)}.blog-post-categories{margin-top:32px;padding-top:24px;border-top:1px solid var(--line)}.blog-post-categories h2{margin:0 0 16px;font-size:1.4rem}.blog-category-chips{display:flex;flex-wrap:wrap;gap:10px}.blog-category-chip{display:inline-flex;align-items:center;padding:8px 14px;border-radius:999px;background:rgba(165,75,42,.10);border:1px solid rgba(165,75,42,.18);font-size:1rem;color:var(--ink)}@media (max-width:1280px){.blog-layout{grid-template-columns:300px minmax(0,1fr)}.blog-taxonomy{position:static;grid-column:1 / -1}}@media (max-width:980px){.blog-layout{grid-template-columns:1fr;padding:20px 14px 40px}.blog-sidebar,.blog-taxonomy{position:static}.blog-sidebar-panel h1,.blog-article h1,.blog-index-copy h1{font-size:2.2rem}.blog-taxonomy-panel h2{font-size:1.8rem}.blog-content-panel{padding:22px 20px 28px}}</style></head><body><div class="blog-layout">${sidebarHtml}<main class="blog-main">${contentHtml}</main>${taxonomyHtml}</div></body></html>`;
 }
-function wrapBlogIndexHtml(posts) {
-  const sidebar = buildBlogSidebarHtml(posts);
+function wrapBlogIndexHtml(posts, weeks = [], months = [], years = []) {
+  const sidebar = buildBlogSidebarHtml(posts, null, weeks, months, years, "index");
   const taxonomy = buildBlogCategorySidebarHtml(posts);
-  const content = [`<section class="blog-content-panel blog-index-copy">`,`<h1>Nikki Blog</h1>`,`<p>左側のインデックスから日付ごとの記事を選べます。</p>`,`<p>各記事ページでは前の日、次の日、一覧へのナビゲーションを上下に配置しています。</p>`,`</section>`].join("");
+  const content = [`<section class="blog-content-panel blog-index-copy">`,`<h1>Nikki Blog</h1>`,`<p>日別、週別、月別、年別のまとまりから記事を選べます。</p>`,`<h2>年別</h2>`,`<ul>${years.map((year) => `<li><a href="./years/${path.posix.basename(year.htmlPath)}">${escapeHtml(year.year)} (${year.postCount}日)</a></li>`).join("")}</ul>`,`<h2>月別</h2>`,`<ul>${months.map((month) => `<li><a href="./months/${path.posix.basename(month.htmlPath)}">${escapeHtml(month.month)} (${month.posts.length}日)</a></li>`).join("")}</ul>`,`<h2>週別</h2>`,`<ul>${weeks.map((week) => `<li><a href="./weeks/${path.posix.basename(week.htmlPath)}">${escapeHtml(week.week)} (${week.posts.length}日)</a></li>`).join("")}</ul>`,`</section>`].join("");
   return wrapBlogLayoutHtml(sidebar, content, taxonomy, "Nikki Blog");
 }
-function wrapBlogPostHtml(post, entry, posts) {
+function wrapBlogPostHtml(post, entry, posts, weeks = [], months = [], years = []) {
     const currentIndex = posts.findIndex((candidate) => candidate.slug === post.slug);
     const previousPost = currentIndex > 0 ? posts[currentIndex - 1] : null;
     const nextPost = currentIndex >= 0 && currentIndex < posts.length - 1 ? posts[currentIndex + 1] : null;
-    const sidebar = buildBlogSidebarHtml(posts, post.slug);
+    const sidebar = buildBlogSidebarHtml(posts, post.slug, weeks, months, years, "post");
     const taxonomy = buildBlogCategorySidebarHtml(posts, post);
     const bodyHtml = marked.parse(entry.markdownBody || "");
     const imageGalleryHtml = buildBlogImageGalleryHtml(post, entry);
@@ -2824,6 +3833,64 @@ function wrapBlogPostHtml(post, entry, posts) {
       `</section>`
     ].join("");
     return wrapBlogLayoutHtml(sidebar, content, taxonomy, entry.title || post.title || "Nikki Blog");
+  }
+  function wrapBlogWeekHtml(week, posts, weeks = [], months = [], years = []) {
+    const sidebar = buildBlogSidebarHtml(posts, null, weeks, months, years, "week");
+    const taxonomy = buildBlogCategorySidebarHtml(week.posts || []);
+    const statsHtml = marked.parse(buildArchiveStatsMarkdown(week.stats));
+    const summaryHtml = week.summary ? marked.parse(buildWeeklySummaryMarkdown(week.summary)) : "";
+    const content = [
+      `<section class="blog-content-panel blog-index-copy">`,
+      `<h1>${escapeHtml(week.summary?.title || week.title)}</h1>`,
+      `<p>${escapeHtml(week.posts.length)}日分の記録</p>`,
+      statsHtml ? `<article class="blog-article">${statsHtml}</article>` : "",
+      summaryHtml ? `<article class="blog-article">${summaryHtml}</article>` : "",
+      `<h2>日別</h2>`,
+      `<ul>`,
+      ...(week.posts || []).map((post) => `<li><a href="../posts/${path.posix.basename(post.htmlPath)}">${escapeHtml(post.date || "unknown")} | ${escapeHtml(post.title)}</a></li>`),
+      `</ul>`,
+      `</section>`
+    ].join("");
+    return wrapBlogLayoutHtml(sidebar, content, taxonomy, week.summary?.title || week.title || "Nikki Blog");
+  }
+  function wrapBlogMonthHtml(month, posts, weeks = [], months = [], years = []) {
+    const sidebar = buildBlogSidebarHtml(posts, null, weeks, months, years, "month");
+    const taxonomy = buildBlogCategorySidebarHtml(month.posts || []);
+    const statsHtml = marked.parse(buildArchiveStatsMarkdown(month.stats));
+    const summaryHtml = month.summary ? marked.parse(buildMonthlySummaryMarkdown(month.summary)) : "";
+    const content = [
+      `<section class="blog-content-panel blog-index-copy">`,
+      `<h1>${escapeHtml(month.summary?.title || month.title)}</h1>`,
+      `<p>${escapeHtml(month.posts.length)}日分の記録</p>`,
+      statsHtml ? `<article class="blog-article">${statsHtml}</article>` : "",
+      summaryHtml ? `<article class="blog-article">${summaryHtml}</article>` : "",
+      `<h2>週別</h2>`,
+      `<ul>`,
+      ...(month.weeks || []).map((week) => `<li><a href="../weeks/${path.posix.basename(week.htmlPath)}">${escapeHtml(week.week)} (${escapeHtml(week.posts.length)}日)</a></li>`),
+      `</ul>`,
+      `</section>`
+    ].join("");
+    return wrapBlogLayoutHtml(sidebar, content, taxonomy, month.summary?.title || month.title || "Nikki Blog");
+  }
+  function wrapBlogYearHtml(year, posts, weeks = [], months = [], years = []) {
+    const sidebar = buildBlogSidebarHtml(posts, null, weeks, months, years, "year");
+    const yearMonths = months.filter((month) => month.month.startsWith(year.year));
+    const taxonomy = buildBlogCategorySidebarHtml(yearMonths.flatMap((month) => month.posts || []));
+    const statsHtml = marked.parse(buildArchiveStatsMarkdown(year.stats));
+    const summaryHtml = year.summary ? marked.parse(buildYearlySummaryMarkdown(year.summary)) : "";
+    const content = [
+      `<section class="blog-content-panel blog-index-copy">`,
+      `<h1>${escapeHtml(year.summary?.title || year.title)}</h1>`,
+      `<p>${escapeHtml(yearMonths.length)}か月、${escapeHtml(year.postCount)}日分の記録</p>`,
+      statsHtml ? `<article class="blog-article">${statsHtml}</article>` : "",
+      summaryHtml ? `<article class="blog-article">${summaryHtml}</article>` : "",
+      `<h2>月別</h2>`,
+      `<ul>`,
+      ...yearMonths.map((month) => `<li><a href="../months/${path.posix.basename(month.htmlPath)}">${escapeHtml(month.month)} (${escapeHtml(month.posts.length)}日)</a></li>`),
+      `</ul>`,
+      `</section>`
+    ].join("");
+    return wrapBlogLayoutHtml(sidebar, content, taxonomy, year.summary?.title || year.title || "Nikki Blog");
   }
   function buildBlogImageGalleryHtml(post, entry) {
     const images = normalizeEntryImages(entry);
@@ -2858,7 +3925,7 @@ function wrapBlogPostHtml(post, entry, posts) {
     }
     function wrapHtml(bodyHtml) { return `<!doctype html><html lang="ja"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Nikki Diary</title><style>:root{--bg:#f5f0e8;--panel:#fffaf3;--ink:#1f1a17;--accent:#a54b2a;--line:#ddcdbd}body{margin:0;font-family:"Yu Mincho","Hiragino Mincho ProN",serif;color:var(--ink);background:radial-gradient(circle at top left,rgba(165,75,42,.10),transparent 28%),linear-gradient(180deg,#f7efe4 0%,#efe5d6 100%)}main{max-width:900px;margin:0 auto;padding:48px 20px 80px}article{background:var(--panel);border:1px solid var(--line);border-radius:20px;box-shadow:0 16px 40px rgba(53,37,24,.08);padding:40px}h1,h2,h3{line-height:1.3}h1{font-size:2.2rem;border-bottom:2px solid var(--accent);padding-bottom:.4em}h2{margin-top:2.4em;color:var(--accent)}p,li{font-size:1rem;line-height:1.9}ul{padding-left:1.4em}.blog-image-gallery,.blog-thread-list{margin-top:32px;padding-top:20px;border-top:1px solid var(--line)}.blog-image-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}.blog-image-card{margin:0}.blog-image-card img{display:block;width:100%;height:auto;border-radius:14px;border:1px solid var(--line)}.blog-image-card figcaption{margin-top:8px;font-size:.95rem;line-height:1.7}.blog-thread-category{color:var(--accent)}.blog-thread-link{margin-left:.5em}@media print{body{background:#fff}main{padding:0}article{box-shadow:none;border:none;border-radius:0;padding:0}}</style></head><body><main><article>${bodyHtml}</article></main></body></html>`; }
 function emitEvent(runtime, payload) { fs.appendFileSync(runtime.paths.events, `${JSON.stringify({ at: isoJst(), runId: runtime.config.runId, ...payload })}\n`, "utf8"); runtime.current.lastEvent = payload.type || null; runtime.current.note = payload.note || null; }
-function writeProgress(runtime, override = {}) { const started = new Date(runtime.startedAt); writeJson(runtime.paths.progress, { schemaVersion: 1, runId: runtime.config.runId, status: override.status ?? "running", stage: override.stage ?? runtime.current.stage, taskKey: override.taskKey ?? runtime.current.taskKey, itemType: override.itemType ?? runtime.current.itemType, currentItemId: override.currentItemId ?? runtime.current.itemId, currentTaskInstanceId: override.currentTaskInstanceId ?? runtime.current.taskInstanceId, counts: { ...runtime.counts }, startedAt: runtime.startedAt, updatedAt: isoJst(), elapsedSec: Number.isNaN(started.getTime()) ? 0 : Math.max(Math.floor((Date.now() - started.getTime()) / 1000), 0), lastEvent: override.lastEvent ?? runtime.current.lastEvent, promptPreview: override.promptPreview ?? runtime.current.promptPreview, sentAt: override.sentAt ?? runtime.current.sentAt, note: override.note ?? runtime.current.note }); }
+function writeProgress(runtime, override = {}) { const started = new Date(runtime.startedAt); writeJson(runtime.paths.progress, { schemaVersion: 1, runId: runtime.config.runId, status: override.status ?? "running", stage: override.stage ?? runtime.current.stage, taskKey: override.taskKey ?? runtime.current.taskKey, itemType: override.itemType ?? runtime.current.itemType, currentItemId: override.currentItemId ?? runtime.current.itemId, currentTaskInstanceId: override.currentTaskInstanceId ?? runtime.current.taskInstanceId, counts: { ...runtime.counts }, startedAt: runtime.startedAt, updatedAt: isoJst(), elapsedSec: Number.isNaN(started.getTime()) ? 0 : Math.max(Math.floor((Date.now() - started.getTime()) / 1000), 0), lastEvent: override.lastEvent ?? runtime.current.lastEvent, promptPreview: override.promptPreview ?? runtime.current.promptPreview, promptStats: override.promptStats ?? runtime.current.promptStats, sentAt: override.sentAt ?? runtime.current.sentAt, note: override.note ?? runtime.current.note }); }
 function logConsole(label, target, note = "") { ensureStreamConsoleClosed(); const suffix = note ? ` ${note}` : ""; console.log(`${consoleTime()} [${label}] ${target}${suffix}`); }
 function logTaskProgressConsole(runtime) {
   ensureStreamConsoleClosed();
@@ -2873,7 +3940,8 @@ function logTaskProgressConsole(runtime) {
   const etaText = eta
     ? `avg=${formatDuration(eta.averageMs)} eta=${formatDuration(eta.remainingMs)} finish=${formatClockTime(new Date(Date.now() + eta.remainingMs))} samples=${eta.samples}`
     : "avg=- eta=-";
-  logConsole("progress", runtime.current.taskInstanceId || "run", `${taskText} ${threadText} ${etaText}`);
+  const inputText = formatPromptStats(runtime.current.promptStats);
+  logConsole("progress", runtime.current.taskInstanceId || "run", `${taskText} ${threadText} ${etaText} ${inputText}`);
 }
 function currentTaskEta(runtime) {
   const taskKey = runtime.current.taskKey;
@@ -2954,6 +4022,54 @@ function formatDuration(ms) {
 function formatClockTime(date) {
   const parts = Object.fromEntries(new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Tokyo", hour: "2-digit", minute: "2-digit" }).formatToParts(date).map((part) => [part.type, part.value]));
   return `${parts.hour}:${parts.minute}`;
+}
+function buildPromptStats({ prompt = "", systemPrompt = "" } = {}) {
+  const promptText = String(prompt || "");
+  const systemText = String(systemPrompt || "");
+  const systemTokensEstimate = estimateInputTokens(systemText);
+  const promptTokensEstimate = estimateInputTokens(promptText);
+  const systemBytes = Buffer.byteLength(systemText, "utf8");
+  const promptBytes = Buffer.byteLength(promptText, "utf8");
+  return {
+    estimate: true,
+    systemTokensEstimate,
+    promptTokensEstimate,
+    estimatedInputTokens: systemTokensEstimate + promptTokensEstimate,
+    systemChars: systemText.length,
+    promptChars: promptText.length,
+    totalChars: systemText.length + promptText.length,
+    systemBytes,
+    promptBytes,
+    totalBytes: systemBytes + promptBytes
+  };
+}
+function estimateInputTokens(text) {
+  const value = String(text || "");
+  if (!value) {
+    return 0;
+  }
+  const asciiChars = (value.match(/[\x00-\x7F]/g) || []).length;
+  const nonAsciiChars = value.length - asciiChars;
+  return Math.ceil(asciiChars / 4 + nonAsciiChars * 0.8);
+}
+function formatPromptStats(stats) {
+  if (!stats) {
+    return "input=-";
+  }
+  return `input≈${formatInteger(stats.estimatedInputTokens)}tok chars=${formatInteger(stats.totalChars)} bytes=${formatBytes(stats.totalBytes)}`;
+}
+function formatInteger(value) {
+  return Number(value || 0).toLocaleString("en-US");
+}
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value >= 1024 * 1024) {
+    return `${(value / 1024 / 1024).toFixed(1)}MB`;
+  }
+  if (value >= 1024) {
+    return `${(value / 1024).toFixed(1)}KB`;
+  }
+  return `${value}B`;
 }
 function logTextBlock(label, target, text) {
   ensureStreamConsoleClosed();
@@ -3492,12 +4608,14 @@ class OllamaClient {
     this.eventLogPath = path.join(config.outputDir, "logs", "ollama-events.log");
     this.command = String(this.ollama.command || "ollama");
     this.activeModel = null;
+    this.waitForIdleModelAfterError = null;
   }
 
   async runJsonTurn({ model, think, cwd, prompt, onProgress }) {
     const preview = clip(prompt.replace(/\s+/g, " "), 220);
     const sentAt = isoJst();
     const finalModel = model || this.config.model;
+    await this.waitForPreviousErrorModelIdle(finalModel, onProgress, preview, sentAt);
     await this.ensureModelReady(finalModel, onProgress, preview, sentAt);
     const systemPrompt = getOllamaSystemPrompt(this.config);
     const body = {
@@ -3519,9 +4637,10 @@ class OllamaClient {
       body.options = this.ollama.options;
     }
 
-    onProgress?.({ phase: "system", promptPreview: preview, sentAt, note: "Ollama system prompt を送信します", systemPrompt });
-    onProgress?.({ phase: "turn-start", promptPreview: preview, sentAt, note: "Ollama にプロンプト送信中" });
-    this.log({ phase: "request", model: finalModel, cwd, promptPreview: preview, think: typeof body.think === "boolean" ? body.think : null });
+    const promptStats = buildPromptStats({ prompt, systemPrompt });
+    onProgress?.({ phase: "system", promptPreview: preview, promptStats, sentAt, note: "Ollama system prompt を送信します", systemPrompt });
+    onProgress?.({ phase: "turn-start", promptPreview: preview, promptStats, sentAt, note: "Ollama にプロンプト送信中" });
+    this.log({ phase: "request", model: finalModel, cwd, promptPreview: preview, promptStats, think: typeof body.think === "boolean" ? body.think : null });
 
     const url = `${this.baseUrl}/api/generate`;
     const timeoutMs = Number(this.ollama.requestTimeoutMs || 0);
@@ -3575,6 +4694,10 @@ class OllamaClient {
         bodyTimeoutMs: bodyTimeoutMs || null,
         error: String(normalizedError.message || normalizedError)
       });
+      if (shouldWaitForOllamaIdleAfterError(normalizedError)) {
+        this.waitForIdleModelAfterError = finalModel;
+        this.log({ phase: "model-idle-wait-scheduled", model: finalModel, reason: String(normalizedError.message || normalizedError) });
+      }
       throw normalizedError;
     }
 
@@ -3584,6 +4707,35 @@ class OllamaClient {
   }
 
   async close() {}
+
+  async waitForPreviousErrorModelIdle(nextModel, onProgress, preview, sentAt) {
+    const model = this.waitForIdleModelAfterError;
+    if (!model || !nextModel || model !== nextModel) {
+      return;
+    }
+    const maxWaitMs = Number(this.ollama.waitForModelIdleAfterErrorMs || 30 * 60 * 1000);
+    const pollMs = Number(this.ollama.waitForModelIdlePollMs || 10000);
+    const startedAt = Date.now();
+    let attempt = 0;
+    while (Date.now() - startedAt < maxWaitMs) {
+      attempt += 1;
+      const loaded = await this.listLoadedModels();
+      if (!loaded.includes(model)) {
+        this.waitForIdleModelAfterError = null;
+        const note = `前回エラー後の ${model} アンロードを確認しました`;
+        onProgress?.({ phase: "ollama-idle", promptPreview: preview, sentAt, note });
+        this.log({ phase: "model-idle-confirmed", model, attempts: attempt, waitedMs: Date.now() - startedAt });
+        return;
+      }
+      const note = `前回エラー後も ${model} がロード中のため、新規リクエストを待機します (${formatDuration(Date.now() - startedAt)}/${formatDuration(maxWaitMs)})`;
+      onProgress?.({ phase: "ollama-busy-wait", promptPreview: preview, sentAt, note });
+      this.log({ phase: "model-idle-wait", model, attempt, waitedMs: Date.now() - startedAt });
+      await sleep(pollMs);
+    }
+    const message = `前回エラー後も ${model} がアンロードされないため、新規リクエストを中止しました (wait=${maxWaitMs}ms)`;
+    this.log({ phase: "model-idle-wait-timeout", model, waitedMs: Date.now() - startedAt });
+    throw new Error(message);
+  }
 
   async ensureModelReady(nextModel, onProgress, preview, sentAt) {
     if (!nextModel || !this.activeModel || this.activeModel === nextModel) {
@@ -3801,6 +4953,11 @@ function isOllamaTimeoutFailure({ rawMessage, causeCode, causeMessage, errorName
   return /The operation was aborted due to timeout|TimeoutError|UND_ERR_HEADERS_TIMEOUT|Headers Timeout Error|UND_ERR_BODY_TIMEOUT|Body Timeout Error|ETIMEDOUT/i.test(text);
 }
 
+function shouldWaitForOllamaIdleAfterError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /Ollama 応答がタイムアウトしました|Ollama への接続に失敗しました|UND_ERR_HEADERS_TIMEOUT|Headers Timeout Error|UND_ERR_BODY_TIMEOUT|Body Timeout Error|fetch failed|ECONNRESET|socket hang up/i.test(message);
+}
+
 function parseOllamaPsModels(text) {
   return String(text || "")
     .split(/\r?\n/)
@@ -3823,6 +4980,7 @@ async function readOllamaStream(response, context) {
   let sawDone = false;
   let responseLineBuffer = "";
   let recentResponseLines = [];
+  let recentResponseLastSemanticLine = "";
   let usage = null;
 
   while (true) {
@@ -3858,10 +5016,12 @@ async function readOllamaStream(response, context) {
           output += responseChunk;
           const repetition = detectRepeatedResponseLine(responseChunk, {
             lineBuffer: responseLineBuffer,
-            recentLines: recentResponseLines
+            recentLines: recentResponseLines,
+            lastSemanticLine: recentResponseLastSemanticLine
           });
           responseLineBuffer = repetition.lineBuffer;
           recentResponseLines = repetition.recentLines;
+          recentResponseLastSemanticLine = repetition.lastSemanticLine;
           if (repetition.abort) {
             context.log({ phase: "response-loop-detected", line: repetition.repeatedLine, count: repetition.repeatedLineCount });
             try {
@@ -3901,10 +5061,12 @@ async function readOllamaStream(response, context) {
       output += responseChunk;
       const repetition = detectRepeatedResponseLine(responseChunk, {
         lineBuffer: responseLineBuffer,
-        recentLines: recentResponseLines
+        recentLines: recentResponseLines,
+        lastSemanticLine: recentResponseLastSemanticLine
       });
       responseLineBuffer = repetition.lineBuffer;
       recentResponseLines = repetition.recentLines;
+      recentResponseLastSemanticLine = repetition.lastSemanticLine;
       if (repetition.abort) {
         context.log({ phase: "response-loop-detected", line: repetition.repeatedLine, count: repetition.repeatedLineCount });
         try {
@@ -3959,6 +5121,7 @@ function toFiniteNumber(value) {
 function detectRepeatedResponseLine(chunk, state) {
   let lineBuffer = `${state.lineBuffer || ""}${String(chunk || "")}`;
   let recentLines = Array.isArray(state.recentLines) ? [...state.recentLines] : [];
+  let lastSemanticLine = state.lastSemanticLine || "";
 
   while (true) {
     const newlineIndex = lineBuffer.indexOf("\n");
@@ -3971,17 +5134,44 @@ function detectRepeatedResponseLine(chunk, state) {
     if (!normalized || normalized.length <= 2) {
       continue;
     }
-    recentLines.push(normalized);
+    const semanticKey = repeatedLineSemanticKey(normalized, lastSemanticLine);
+    lastSemanticLine = semanticHistoryLine(normalized) || lastSemanticLine;
+    if (!semanticKey) {
+      continue;
+    }
+    recentLines.push(semanticKey);
     if (recentLines.length > 100) {
       recentLines = recentLines.slice(recentLines.length - 100);
     }
-    const repeatedLineCount = recentLines.filter((line) => line === normalized).length;
+    const repeatedLineCount = recentLines.filter((line) => line === semanticKey).length;
     if (repeatedLineCount >= 10) {
-      return { lineBuffer, recentLines, repeatedLine: normalized, repeatedLineCount, abort: true };
+      return { lineBuffer, recentLines, lastSemanticLine, repeatedLine: normalized, repeatedLineCount, abort: true };
     }
   }
 
-  return { lineBuffer, recentLines, repeatedLine: null, repeatedLineCount: 0, abort: false };
+  return { lineBuffer, recentLines, lastSemanticLine, repeatedLine: null, repeatedLineCount: 0, abort: false };
+}
+
+function repeatedLineSemanticKey(line, previousSemanticLine) {
+  if (isRepeatedStatusLine(line)) {
+    if (isRepeatedTextLine(previousSemanticLine)) {
+      return `${previousSemanticLine}\n${line}`;
+    }
+    return null;
+  }
+  return line;
+}
+
+function semanticHistoryLine(line) {
+  return isRepeatedTextLine(line) ? line : null;
+}
+
+function isRepeatedTextLine(line) {
+  return /^"text"\s*:\s*".*"?\s*,?$/.test(String(line || "").trim());
+}
+
+function isRepeatedStatusLine(line) {
+  return /^"status"\s*:\s*"(resolved|unresolved|partially_resolved)"\s*,?$/.test(String(line || "").trim());
 }
 
 function parseOllamaStreamChunk(line) {

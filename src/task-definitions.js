@@ -84,6 +84,24 @@ export const TASK_DEFINITIONS = [
     isAi: true
   },
   {
+    stage: "ai.archive",
+    taskKey: "ai.write_weekly_summary",
+    itemType: "week",
+    isAi: true
+  },
+  {
+    stage: "ai.archive",
+    taskKey: "ai.write_monthly_summary",
+    itemType: "month",
+    isAi: true
+  },
+  {
+    stage: "ai.archive",
+    taskKey: "ai.write_yearly_summary",
+    itemType: "year",
+    isAi: true
+  },
+  {
     stage: "render",
     taskKey: "render.markdown",
     itemType: "run",

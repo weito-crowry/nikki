@@ -1,0 +1,73 @@
+You are part of a multi-step diary generation pipeline.
+
+Return exactly one valid JSON object.
+Do not output markdown outside the JSON string values.
+Do not output code fences.
+Do not output explanations.
+Do not output text before or after JSON.
+Use double quotes for all keys and string values.
+All required keys must appear.
+If a field has no information, use [] or "".
+Do not duplicate keys.
+Do not invent facts.
+
+Task:
+Write a weekly diary summary from daily diary entries.
+
+Your job is only:
+- create a weekly title
+- write a short overview
+- identify recurring themes
+- list notable days
+- write a closing reflection
+
+Do:
+- summarize the whole week
+- preserve factual accuracy
+- write from the perspective of a weekly record of activity
+- mention concrete days when they are important
+- merge repeated topics without losing important differences
+- use the stats to describe scale and frequent topics when useful
+- token counts are rough estimates of source conversation text, not exact billing usage
+
+Do not:
+- invent events not present in the daily entries
+- turn the week into a generic topic article
+- include every small detail
+- overstate progress or conclusions
+
+Output schema:
+{
+  "title": "...",
+  "overview": "...",
+  "themes": [
+    {
+      "heading": "...",
+      "body": "..."
+    }
+  ],
+  "notableDays": [
+    {
+      "date": "YYYY-MM-DD",
+      "title": "...",
+      "note": "..."
+    }
+  ],
+  "closing": "..."
+}
+
+Strict rules:
+- title must represent the whole week
+- overview should briefly describe the week as a record
+- themes should describe what was repeatedly handled, explored, checked, or produced
+- notableDays should include only days that stand out from the input
+- closing should summarize the week briefly
+- do not add facts that are not in the input
+- if you mention counts or frequent topics, use only the provided stats
+- treat estimatedInputTokens and estimatedOutputTokens as approximate values
+
+Week id: {{weekId}}
+Week: {{week}}
+
+Weekly input:
+{{weekJson}}

@@ -12,7 +12,7 @@ Do not duplicate keys.
 Do not invent facts.
 
 Task:
-Merge multiple turn-level summaries into one thread-level summary.
+Merge multiple turn-level or partial thread summaries into one thread-level summary.
 
 The thread classification was already merged by code.
 Do not re-classify the thread.
@@ -59,8 +59,8 @@ Output schema:
 Strict rules:
 - summaryTitle should summarize the thread as a whole
 - interests should be concise topic phrases
-- questions should come from the turn summaries
-- outcomes should be concrete results supported by the turn summaries
+- questions should come from the provided summaries
+- outcomes should be concrete results supported by the provided summaries
 - narrative should describe what happened in the thread, not lecture about the topic
 - reason should briefly explain why the merged classification fits the thread
 

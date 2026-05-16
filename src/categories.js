@@ -123,7 +123,28 @@ function normalizeChildCategories(categories, group) {
       keywords: uniqueStrings(Array.isArray(item.keywords) ? item.keywords : []).slice(0, 6)
     });
   }
+  const fallback = fallbackCategoryForGroup(group);
+  if (!seen.has(fallback.id)) {
+    result.push(fallback);
+  }
   return result;
+}
+
+function fallbackCategoryForGroup(group) {
+  if (group.id === "other") {
+    return {
+      id: "uncategorized",
+      label: "未分類",
+      description: "既存カテゴリに明確に収まらない話題。",
+      keywords: []
+    };
+  }
+  return {
+    id: `${group.id}-uncategorized`,
+    label: `${group.label}その他`,
+    description: `${group.label}に属するが詳細カテゴリ未確定の話題。`,
+    keywords: []
+  };
 }
 
 export function normalizeProposedCategories(items) {

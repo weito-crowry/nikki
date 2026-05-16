@@ -49,10 +49,12 @@ function resolveConfig(options, positionals = []) {
     grouping: options["group-by"] ?? fileConfig.grouping ?? "thread-start-day",
     executionOrder: options["execution-order"] ?? fileConfig.executionOrder ?? "task",
     aiMode: options["ai-mode"] ?? fileConfig.aiMode ?? "ai",
+    classificationMode: options["classification-mode"] ?? fileConfig.classificationMode ?? "ai",
     model: options.model ?? fileConfig.model ?? "gpt-5.4",
     taskModels: normalizeTaskModels(fileConfig.taskModels),
     taskThinks: normalizeTaskThinks(fileConfig.taskThinks),
     categoryGroups: normalizeCategoryGroups(fileConfig.categoryGroups),
+    categoryMasterSeedPath: options["category-master-seed"] ?? fileConfig.categoryMasterSeedPath ?? null,
     maxCategories: Number(options["max-categories"] ?? fileConfig.maxCategories ?? 12),
     categoriesPerMessage: Number(options["categories-per-message"] ?? fileConfig.categoriesPerMessage ?? 2),
     summaryLanguage: options.language ?? fileConfig.summaryLanguage ?? "ja",
@@ -84,6 +86,10 @@ function resolveConfig(options, positionals = []) {
     merged.outputDir = path.resolve(merged.outputDir);
   }
 
+  if (merged.categoryMasterSeedPath) {
+    merged.categoryMasterSeedPath = path.resolve(merged.categoryMasterSeedPath);
+  }
+
   return merged;
 }
 
@@ -92,6 +98,7 @@ function printUsage() {
   node src/cli.js run --zip <zip> --output <dir> [--group-by thread-start-day|message-day|category] [--force]
     [--execution-order task|date]
     [--ai-mode ai|deterministic]
+    [--classification-mode ai|keyword] [--category-master-seed <path>]
     [--only <taskKey[,taskKey...]>] [--rerun-scope <thread[,unit]>] [--item-id <id[,id...]>] [--thread-id <id[,id...]>]
     [--target-date YYYY-MM-DD] [--target-week YYYY-MM-Wn] [--target-month YYYY-MM] [--target-year YYYY]
     [--exclude-thread-id <thread_000001[,thread_000002...]>] [--exclude-source-thread-id <sourceId[,sourceId...]>]

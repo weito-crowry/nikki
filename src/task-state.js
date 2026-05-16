@@ -45,7 +45,7 @@ export function resolveDependsOn(runtime, taskKey, itemId) {
   if (taskKey === "ai.generate_category_candidates") return [taskInstanceId("analyze.attach_images", "run")];
   if (taskKey === "analyze.split_thread_turns") return [taskInstanceId("analyze.attach_images", "run")];
   if (taskKey === "ai.summarize_turn") return [taskInstanceId("analyze.split_thread_turns", readTurn(runtime, itemId).threadItemId)];
-  if (taskKey === "ai.classify_turn") return [taskInstanceId("analyze.split_thread_turns", readTurn(runtime, itemId).threadItemId), taskInstanceId("ai.generate_category_candidates", "run")];
+  if (taskKey === "ai.classify_turn") return [taskInstanceId("analyze.split_thread_turns", readTurn(runtime, itemId).threadItemId), taskInstanceId("ai.generate_category_candidates", "run"), taskInstanceId("ai.summarize_turn", itemId)];
   if (taskKey === "ai.merge_thread_turns") return loadTurnsForThread(runtime, itemId).flatMap((turn) => [taskInstanceId("ai.summarize_turn", turn.itemId), taskInstanceId("ai.classify_turn", turn.itemId)]);
   if (taskKey === "analyze.group_units") return (readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || [])
     .filter((thread) => threadMatchesTargetScopes(thread, runtime.config))
@@ -94,6 +94,12 @@ export function getInvalidation(runtime, definition, item, state, meta, dependsO
   }
   if (state.status === "failed") {
     return { reason: runtime.config.retryFailed ? "failed task を再試行します" : "failed task を再実行します" };
+  }
+  if (state.status === "completed" && definition.taskKey === "ai.classify_turn" && (state.model === null) !== (meta.model === null)) {
+    return { reason: "classificationMode が変化したため再実行します" };
+  }
+  if (state.status === "completed" && definition.taskKey === "ai.classify_turn" && runtime.config.classificationMode === "keyword" && state.inputHash !== meta.inputHash) {
+    return { reason: "keyword classification inputHash が変化したため再実行します" };
   }
   if (state.status === "completed" && isPersistentAiTask(definition)) {
     if (!hasArtifacts(runtime, state.artifactPaths)) {
@@ -196,6 +202,9 @@ export function validateRunOptions(runtime) {
   }
   if (!["ai", "deterministic"].includes(runtime.config.aiMode || "ai")) {
     throw new Error(`aiMode は ai または deterministic で指定してください: ${runtime.config.aiMode}`);
+  }
+  if (!["ai", "keyword"].includes(runtime.config.classificationMode || "ai")) {
+    throw new Error(`classificationMode は ai または keyword で指定してください: ${runtime.config.classificationMode}`);
   }
   if (runtime.config.date && !/^\d{4}-\d{2}-\d{2}$/.test(runtime.config.date)) {
     throw new Error(`--date の形式が不正です: ${runtime.config.date}`);

@@ -1,4 +1,5 @@
 import path from "node:path";
+import { KEYWORD_CLASSIFIER_VERSION } from "./keyword-classifier.js";
 
 let taskMetaDeps = null;
 
@@ -70,7 +71,7 @@ export async function buildTaskMeta(runtime, definition, item) {
       case "ai.generate_category_candidates": {
         const groups = normalizeCategoryGroups(runtime.config.categoryGroups);
         return {
-          inputHash: hashJson({ schema: "category-master-v2", groups }),
+          inputHash: hashJson({ schema: "category-master-v3", groups, seedPath: runtime.config.categoryMasterSeedPath || null, seedStat: fileStat(runtime.config.categoryMasterSeedPath) }),
           promptHash: null,
           model: null,
           promptPreview: null
@@ -90,6 +91,24 @@ export async function buildTaskMeta(runtime, definition, item) {
       case "ai.classify_turn": {
         const turn = compactTurnForAi(readTurn(runtime, item.itemId));
         const categories = readCategoryMaster(runtime) || {};
+        const turnSummary = readArtifact(runtime, `artifacts/ai/turn_summaries/${item.itemId}.json`) || null;
+        if (runtime.config.classificationMode === "keyword") {
+          const input = {
+            classificationMode: "keyword",
+            classifierVersion: KEYWORD_CLASSIFIER_VERSION,
+            categoryMaster: categories,
+            turn,
+            turnSummary
+          };
+          return {
+            input,
+            inputHash: hashJson(input),
+            promptHash: null,
+            model: null,
+            think: null,
+            promptPreview: `local keyword classification v${KEYWORD_CLASSIFIER_VERSION}`
+          };
+        }
         const prompt = renderPromptTemplate("ai.classify_thread", {
           categoryGroupsJson: JSON.stringify(categories.groups || [], null, 2),
           flatCategoriesJson: JSON.stringify(categories.categories || [], null, 2),

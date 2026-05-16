@@ -15,6 +15,7 @@ import { closeAppServerClient, configureAgentClient, getAppServerClient, getOlla
 import { buildArchiveStatsFromEntries, configureRenderHandlers, draftToMarkdown, handleRenderHtml, handleRenderMarkdown, handleRenderPdf } from "./render.js";
 import { configureCategoryHelpers, defaultCategoryGroups, mergeCategoryMaster, normalizeCategoryGroups, normalizeCategoryMaster, normalizeProposedCategories, readCategoryMaster, writeCategoryMaster } from "./categories.js";
 import { configureDeterministicHandlers, handleClassifyTurnDeterministic, handleMergeThreadTurnsDeterministic, handleRewriteEntryDeterministic, handleSummarizeTurnDeterministic, handleSummarizeUnitDeterministic, handleWriteEntryDeterministic, handleWriteMonthlySummaryDeterministic, handleWriteWeeklySummaryDeterministic, handleWriteYearlySummaryDeterministic } from "./deterministic.js";
+import { KEYWORD_CLASSIFIER_THRESHOLD, KEYWORD_CLASSIFIER_VERSION } from "./keyword-classifier.js";
 
 const execFileAsync = promisify(execFile);
 let appServerClientPromise = null;
@@ -184,7 +185,7 @@ function createRuntime(config) {
   const provider = resolveConfiguredProvider(config.provider);
   const runtimeConfig = normalizeAgentRuntimeConfig(config, provider);
   return {
-    config: { ...config, provider, runtime: runtimeConfig, runId, taskModels: config.taskModels || {} },
+    config: { ...config, provider, runtime: runtimeConfig, runId, taskModels: config.taskModels || {}, classificationMode: config.classificationMode || "ai" },
     paths: {
       root: config.outputDir,
       lock: path.join(config.outputDir, ".run.lock.json"),
@@ -1513,6 +1514,9 @@ async function handleClassifyTurn(runtime, itemId, meta) {
   if (isDeterministicAiMode(runtime)) {
     return handleClassifyTurnDeterministic(runtime, itemId, meta);
   }
+  if (runtime.config.classificationMode === "keyword") {
+    return handleClassifyTurnKeyword(runtime, itemId, meta);
+  }
   const turn = readTurn(runtime, itemId);
   const categories = readCategoryMaster(runtime) || {};
   const response = await askForJson(runtime, "ai.classify_turn", itemId, `turn-classify-${itemId}`, meta);
@@ -1546,6 +1550,40 @@ async function handleClassifyTurn(runtime, itemId, meta) {
   });
   writeRaw(runtime, "ai.classify_turn", itemId, response.text, response.usage);
   return artifactPaths;
+}
+
+async function handleClassifyTurnKeyword(runtime, itemId, meta) {
+  const turn = readTurn(runtime, itemId);
+  const categories = readCategoryMaster(runtime) || {};
+  const thread = readArtifact(runtime, `artifacts/normalized/${turn.threadItemId}.json`) || {};
+  const turnSummary = readArtifact(runtime, `artifacts/ai/turn_summaries/${itemId}.json`) || {};
+  const result = classifyTurnWithKeywords({ turn, thread, turnSummary, categoryMaster: categories });
+  const artifact = {
+    schemaVersion: 1,
+    generatedAt: isoJst(),
+    runId: runtime.config.runId,
+    itemId,
+    threadItemId: turn.threadItemId,
+    date: turn.date,
+    turnIndex: turn.turnIndex,
+    primaryGroup: result.primaryGroup,
+    primaryGroupLabel: result.primaryGroupLabel,
+    primaryCategory: result.primaryCategory,
+    primaryCategoryLabel: result.primaryCategoryLabel,
+    secondaryCategories: result.secondaryCategories,
+    secondaryCategoryLabels: result.secondaryCategoryLabels,
+    reason: result.reason,
+    proposedCategories: [],
+    tags: result.tags,
+    classificationMeta: result.classificationMeta,
+    aiMeta: buildLocalAiMeta(runtime, meta, {
+      provider: "local-keyword-classifier",
+      classificationMode: "keyword",
+      classifierVersion: KEYWORD_CLASSIFIER_VERSION
+    })
+  };
+  writeArtifact(runtime, `artifacts/ai/turn_classification/${itemId}.json`, artifact);
+  return [`artifacts/ai/turn_classification/${itemId}.json`];
 }
 
 async function handleMergeThreadTurns(runtime, itemId, meta) {
@@ -1612,6 +1650,212 @@ async function handleMergeThreadTurns(runtime, itemId, meta) {
   });
   writeRaw(runtime, "ai.merge_thread_turns", itemId, response.text, response.usage);
   return artifactPaths;
+}
+
+function classifyTurnWithKeywords({ turn, thread, turnSummary, categoryMaster }) {
+  const groups = Array.isArray(categoryMaster?.groups) && categoryMaster.groups.length
+    ? categoryMaster.groups
+    : normalizeCategoryMaster({ config: { categoryGroups: null, runId: "local" } }, { groups: [] }).groups;
+  const weightedTexts = buildWeightedClassificationTexts(turn, thread, turnSummary);
+  const contextText = weightedTexts.map((entry) => entry.text).join("\n").toLowerCase();
+  const scores = [];
+  for (const group of groups) {
+    const groupScore = scoreTaxonomyNode(group, weightedTexts, 1);
+    const categories = Array.isArray(group.categories) && group.categories.length ? group.categories : [];
+    for (const category of categories) {
+      const categoryScore = scoreTaxonomyNode(category, weightedTexts, 1.4);
+      const contextBoost = contextualCategoryBoost(group, category, contextText);
+      const score = groupScore.score + categoryScore.score + contextBoost.score;
+      scores.push({
+        group,
+        category,
+        score,
+        matchedTerms: uniqueStrings([...groupScore.matchedTerms, ...categoryScore.matchedTerms, ...contextBoost.matchedTerms])
+      });
+    }
+  }
+  scores.sort((left, right) => right.score - left.score || left.group.id.localeCompare(right.group.id, "ja") || left.category.id.localeCompare(right.category.id, "ja"));
+  const best = selectBestKeywordClassification(groups, scores);
+  const secondary = scores
+    .filter((entry) => entry.category.id !== best.category.id && entry.score >= KEYWORD_CLASSIFIER_THRESHOLD)
+    .slice(0, 2);
+  const ambiguousTerms = detectAmbiguousTerms(contextText);
+  const tags = extractKeywordTags(weightedTexts, best, secondary);
+  const reason = buildKeywordClassificationReason(best, secondary, ambiguousTerms);
+  return {
+    primaryGroup: best.group.id,
+    primaryGroupLabel: best.group.label,
+    primaryCategory: best.category.id,
+    primaryCategoryLabel: best.category.label,
+    secondaryCategories: secondary.map((entry) => entry.category.id),
+    secondaryCategoryLabels: secondary.map((entry) => entry.category.label),
+    reason,
+    tags,
+    classificationMeta: {
+      mode: "keyword",
+      classifierVersion: KEYWORD_CLASSIFIER_VERSION,
+      threshold: KEYWORD_CLASSIFIER_THRESHOLD,
+      scores: scores.slice(0, 8).map((entry) => ({
+        groupId: entry.group.id,
+        categoryId: entry.category.id,
+        score: Math.round(entry.score * 10) / 10,
+        matchedTerms: entry.matchedTerms.slice(0, 12)
+      })),
+      ambiguousTerms
+    }
+  };
+}
+
+function buildWeightedClassificationTexts(turn, thread, turnSummary) {
+  return [
+    { source: "turnSummary.userIntent", weight: 5, text: turnSummary?.userIntent || "" },
+    { source: "turnSummary.outcome", weight: 4, text: turnSummary?.outcome || "" },
+    { source: "turnSummary.assistantResponse", weight: 3, text: turnSummary?.assistantResponse || "" },
+    { source: "thread.title", weight: 5, text: thread?.title || "" },
+    { source: "thread.preview", weight: 2, text: thread?.preview || "" },
+    { source: "promptMessages", weight: 3, text: messagesToText(turn?.promptMessages || []) },
+    { source: "responseMessages", weight: 1.5, text: messagesToText(turn?.responseMessages || []) }
+  ].filter((entry) => entry.text);
+}
+
+function messagesToText(messages) {
+  return (messages || []).map((message) => {
+    if (typeof message === "string") return message;
+    if (!message || typeof message !== "object") return "";
+    return [message.text, message.content, message.body, message.preview].filter(Boolean).join("\n");
+  }).join("\n");
+}
+
+function scoreTaxonomyNode(node, weightedTexts, multiplier) {
+  const terms = uniqueStrings([
+    node?.label,
+    ...(Array.isArray(node?.keywords) ? node.keywords : []),
+    ...splitDescriptionTerms(node?.description || "")
+  ]).filter((term) => String(term).length >= 2);
+  const matchedTerms = [];
+  let score = 0;
+  for (const term of terms) {
+    const termScore = weightedTexts.reduce((sum, entry) => sum + entry.weight * countTerm(entry.text, term), 0);
+    if (termScore > 0) {
+      matchedTerms.push(term);
+      score += termScore * multiplier;
+    }
+  }
+  return { score, matchedTerms };
+}
+
+function splitDescriptionTerms(text) {
+  return String(text).split(/[、。,\s/・（）()「」『』【】\[\]{}:：]+/).map((term) => term.trim()).filter((term) => term.length >= 3).slice(0, 12);
+}
+
+function countTerm(text, term) {
+  const haystack = String(text || "").toLowerCase();
+  const needle = String(term || "").toLowerCase();
+  if (!needle) return 0;
+  let count = 0;
+  let index = haystack.indexOf(needle);
+  while (index !== -1) {
+    count += 1;
+    index = haystack.indexOf(needle, index + needle.length);
+  }
+  return count;
+}
+
+function contextualCategoryBoost(group, category, contextText) {
+  const rules = [
+    {
+      groupHints: ["technology"],
+      categoryHints: ["nlp", "ai", "llm", "local", "tool", "program"],
+      contexts: ["形態素解析", "品詞", "名詞", "辞書", "トークナイザ", "tokenizer", "mecab", "kuromoji", "自然言語処理"],
+      score: 18
+    },
+    {
+      groupHints: ["life"],
+      categoryHints: ["food", "cooking", "health", "life"],
+      contexts: ["海藻", "酢の物", "味噌汁", "食べる", "料理", "献立", "食材"],
+      score: 14
+    },
+    {
+      groupHints: ["technology"],
+      categoryHints: ["llm", "ai", "local", "codex", "tool"],
+      contexts: ["codex", "ollama", "gemini", "gpt", "llm", "api", "node", "javascript", "typescript", "github"],
+      score: 10
+    }
+  ];
+  const matchedTerms = [];
+  let score = 0;
+  const groupText = `${group?.id || ""} ${group?.label || ""}`.toLowerCase();
+  const categoryText = `${category?.id || ""} ${category?.label || ""} ${category?.description || ""}`.toLowerCase();
+  for (const rule of rules) {
+    const groupMatches = rule.groupHints.some((hint) => groupText.includes(hint));
+    const categoryMatches = rule.categoryHints.some((hint) => categoryText.includes(hint));
+    const terms = rule.contexts.filter((term) => contextText.includes(term.toLowerCase()));
+    if ((groupMatches || categoryMatches) && terms.length) {
+      score += rule.score + terms.length * 2;
+      matchedTerms.push(...terms);
+    }
+  }
+  return { score, matchedTerms };
+}
+
+function selectBestKeywordClassification(groups, scores) {
+  const best = scores[0] || null;
+  if (best && best.score >= KEYWORD_CLASSIFIER_THRESHOLD) {
+    return best;
+  }
+  const group = best?.group || groups.find((entry) => entry.id !== "other") || groups[0];
+  return {
+    group,
+    category: fallbackCategoryForClassification(group),
+    score: best?.score || 0,
+    matchedTerms: best?.matchedTerms || []
+  };
+}
+
+function fallbackCategoryForClassification(group) {
+  const fallbackId = group.id === "other" ? "uncategorized" : `${group.id}-uncategorized`;
+  return (group.categories || []).find((category) => category.id === fallbackId)
+    || (group.categories || [])[0]
+    || { id: fallbackId, label: group.id === "other" ? "未分類" : `${group.label}その他`, description: "", keywords: [] };
+}
+
+function detectAmbiguousTerms(contextText) {
+  const result = [];
+  if (contextText.includes("めかぶ") || contextText.includes("mecab")) {
+    const nlpTerms = ["形態素解析", "品詞", "名詞", "辞書", "トークナイザ", "tokenizer", "mecab"].filter((term) => contextText.includes(term.toLowerCase()));
+    const foodTerms = ["海藻", "酢の物", "味噌汁", "食べる", "料理"].filter((term) => contextText.includes(term.toLowerCase()));
+    if (nlpTerms.length || foodTerms.length) {
+      result.push({
+        term: contextText.includes("めかぶ") ? "めかぶ" : "MeCab",
+        candidates: ["MeCab", "海藻"],
+        selected: nlpTerms.length >= foodTerms.length ? "MeCab" : "海藻",
+        reason: `context contains ${[...nlpTerms, ...foodTerms].slice(0, 5).join(", ")}`
+      });
+    }
+  }
+  return result;
+}
+
+function extractKeywordTags(weightedTexts, best, secondary) {
+  const text = weightedTexts.map((entry) => entry.text).join("\n");
+  const tokens = text.match(/[A-Za-z][A-Za-z0-9._+-]{1,}|[ァ-ヴー]{2,}|[一-龠々]{2,}/g) || [];
+  const stopWords = new Set(["これ", "それ", "ため", "こと", "もの", "よう", "さん", "する", "した", "して", "ある", "いる", "お願い", "確認", "対応"]);
+  const counts = new Map();
+  for (const token of tokens.map((item) => item.trim()).filter((item) => item.length >= 2 && !stopWords.has(item))) {
+    counts.set(token, (counts.get(token) || 0) + 1);
+  }
+  const taxonomyTerms = [best, ...secondary].flatMap((entry) => [entry.group.label, entry.category.label, ...(entry.matchedTerms || [])]).filter(Boolean);
+  return uniqueStrings([
+    ...taxonomyTerms.slice(0, 6),
+    ...[...counts.entries()].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], "ja")).map(([token]) => token).slice(0, 10)
+  ]).slice(0, 12);
+}
+
+function buildKeywordClassificationReason(best, secondary, ambiguousTerms) {
+  const matched = best.matchedTerms?.length ? `matched: ${best.matchedTerms.slice(0, 5).join(", ")}` : "matched terms were weak";
+  const sub = secondary.length ? `; secondary: ${secondary.map((entry) => `${entry.group.id}/${entry.category.id}`).join(", ")}` : "";
+  const ambiguous = ambiguousTerms.length ? `; ambiguous: ${ambiguousTerms.map((entry) => `${entry.term}->${entry.selected}`).join(", ")}` : "";
+  return `keyword classifier selected ${best.group.id}/${best.category.id} (${matched})${sub}${ambiguous}`;
 }
 
 async function askForMergedThreadJson(runtime, itemId, meta, context) {
@@ -1767,7 +2011,8 @@ function threadMergeChunkSize(runtime) {
 
 async function handleCategories(runtime, meta) {
   const current = readCategoryMaster(runtime);
-  const next = normalizeCategoryMaster(runtime, current || { schemaVersion: 2, generatedAt: isoJst(), runId: runtime.config.runId, groups: [] });
+  const seed = !current && runtime.config.categoryMasterSeedPath ? readJson(runtime.config.categoryMasterSeedPath) : null;
+  const next = normalizeCategoryMaster(runtime, current || seed || { schemaVersion: 2, generatedAt: isoJst(), runId: runtime.config.runId, groups: [] });
   writeCategoryMaster(runtime, {
     ...next,
     aiMeta: {
@@ -1776,7 +2021,8 @@ async function handleCategories(runtime, meta) {
       promptHash: meta.promptHash,
       inputHash: meta.inputHash,
       provider: "local",
-      cacheHit: Boolean(current)
+      cacheHit: Boolean(current),
+      seedPath: seed ? runtime.config.categoryMasterSeedPath : null
     }
   });
   return ["artifacts/ai/category_master.json", "artifacts/ai/categories.json"];

@@ -119,6 +119,7 @@ npm run run:prod:ollama:qwen3.5-0.8b
   "grouping": "thread-start-day",
   "executionOrder": "task",
   "aiMode": "ai",
+  "classificationMode": "ai",
   "model": "gpt-5-mini",
   "taskModels": {
     "ai.classify_thread": "gpt-5-mini",
@@ -128,6 +129,7 @@ npm run run:prod:ollama:qwen3.5-0.8b
     "ai.rewrite_diary_entry": "gpt-5-mini"
   },
   "freezeCategories": true,
+  "categoryMasterSeedPath": "./output/previous-run/artifacts/ai/category_master.json",
   "targetDates": ["2024-08-16", "2024-08-18"],
   "targetWeeks": ["2024-08-W3"],
   "targetMonths": ["2024-08"],
@@ -207,7 +209,11 @@ Ollama の例:
 
 `freezeCategories: true` の場合は既存 master を固定再利用します。  
 `ai.generate_category_candidates` は設定済みの `categoryGroups` またはデフォルト大カテゴリから category master を初期化する非AI task です。  
-`ai.classify_thread` は必要時に `proposedCategories` を返し、master に新カテゴリを自動追加します。追加履歴は `artifacts/ai/category_suggestions.json` に残ります。
+`ai.classify_turn` は AI モードでは必要時に `proposedCategories` を返し、master に新カテゴリを自動追加します。追加履歴は `artifacts/ai/category_suggestions.json` に残ります。
+
+`classificationMode: "keyword"` または `--classification-mode keyword` を指定すると、`ai.classify_turn` だけをローカル keyword classifier で実行します。`ai.summarize_turn`、`ai.merge_thread_turns`、日記本文生成は従来通り AI task のままです。keyword 分類では `askForJson()` を呼ばず、`artifacts/ai/turn_classification/<itemId>.json` に既存互換フィールドと `tags` / `classificationMeta` を出力します。raw AI artifact は生成しません。
+
+keyword 分類は category master を即更新しません。`proposedCategories` は当面 `[]` で、カテゴリは管理対象、タグは自動抽出対象として扱います。空に近い master でも破綻しにくいよう、各 group に `<groupId>-uncategorized`、`other` group に `uncategorized` fallback category を自動補完します。過去実行の master を seed にする場合は `categoryMasterSeedPath` または `--category-master-seed` に `artifacts/ai/category_master.json` を指定してください。
 
 ### 増分実行
 
@@ -262,11 +268,21 @@ node src/cli.js run --config ./nikki.config.json --execution-order date --skip-c
   config の `targetThreadItemIds` と同じ用途の簡易指定
 - `--freeze-categories`
   category master を固定再利用
+- `--classification-mode ai|keyword`
+  `ai.classify_turn` の分類経路を指定。既定は `ai`
+- `--category-master-seed <path>`
+  初回 category master 作成時に既存 `category_master.json` を seed として読む
 
 例:
 
 ```bash
 node src/cli.js run --config ./nikki.config.prod.copilot.json --skip-completed --freeze-categories
+```
+
+分類だけ deterministic に寄せる:
+
+```bash
+node src/cli.js run --config ./nikki.config.prod.copilot.json --classification-mode keyword --skip-completed
 ```
 
 特定 thread の分類だけやり直す:

@@ -48,6 +48,7 @@ function resolveConfig(options, positionals = []) {
     runtime: normalizeRuntimeConfig(fileConfig.runtime),
     grouping: options["group-by"] ?? fileConfig.grouping ?? "thread-start-day",
     executionOrder: options["execution-order"] ?? fileConfig.executionOrder ?? "task",
+    aiMode: options["ai-mode"] ?? fileConfig.aiMode ?? "ai",
     model: options.model ?? fileConfig.model ?? "gpt-5.4",
     taskModels: normalizeTaskModels(fileConfig.taskModels),
     taskThinks: normalizeTaskThinks(fileConfig.taskThinks),
@@ -90,6 +91,7 @@ function printUsage() {
   console.log(`使い方:
   node src/cli.js run --zip <zip> --output <dir> [--group-by thread-start-day|message-day|category] [--force]
     [--execution-order task|date]
+    [--ai-mode ai|deterministic]
     [--only <taskKey[,taskKey...]>] [--rerun-scope <thread[,unit]>] [--item-id <id[,id...]>] [--thread-id <id[,id...]>]
     [--target-date YYYY-MM-DD] [--target-week YYYY-MM-Wn] [--target-month YYYY-MM] [--target-year YYYY]
     [--exclude-thread-id <thread_000001[,thread_000002...]>] [--exclude-source-thread-id <sourceId[,sourceId...]>]

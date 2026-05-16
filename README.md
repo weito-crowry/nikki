@@ -84,6 +84,7 @@ npm run run:prod:ollama:qwen3.5-0.8b
 - `provider`
 - `runtime`
 - `grouping`
+- `aiMode`
 - `model`
 - `taskModels`
 - `taskThinks`
@@ -117,6 +118,7 @@ npm run run:prod:ollama:qwen3.5-0.8b
   },
   "grouping": "thread-start-day",
   "executionOrder": "task",
+  "aiMode": "ai",
   "model": "gpt-5-mini",
   "taskModels": {
     "ai.classify_thread": "gpt-5-mini",
@@ -271,6 +273,14 @@ node src/cli.js run --config ./nikki.config.prod.copilot.json --skip-completed -
 
 ```bash
 node src/cli.js run --config ./nikki.config.prod.copilot.json --skip-completed --only ai.classify_thread --item-id thread_001134
+```
+
+### 非AI deterministic 実行
+
+`aiMode: "deterministic"` または `--ai-mode deterministic` を指定すると、主要な `ai.*` task はモデルを呼ばず、同じ artifact schema のローカル変換で実行します。カテゴリ分類はキーワード一致、要約と日記本文は既存 artifact からのテンプレ生成です。
+
+```bash
+node src/cli.js run --zip ./export.zip --output ./output/run-local --ai-mode deterministic
 ```
 
 ## 進捗とログ

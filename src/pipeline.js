@@ -7,8 +7,14 @@ import https from "node:https";
 import { execFile, spawn } from "node:child_process";
 import { Readable } from "node:stream";
 import { promisify } from "node:util";
-import { marked } from "marked";
 import { TASK_DEFINITIONS } from "./task-definitions.js";
+import { applyItemFilters, configureTaskState, getInvalidation, migrateReusableState, resolveDependsOn, reusable, validateRunOptions } from "./task-state.js";
+import { buildTaskMeta, configureTaskMeta } from "./task-meta.js";
+import { askForJson, configureAiJson, isContextOverflowFailure, writeRaw } from "./ai-json.js";
+import { closeAppServerClient, configureAgentClient, getAppServerClient, getOllamaSystemPrompt, normalizeAgentRuntimeConfig, resolveRuntimeProvider } from "./agent-client.js";
+import { buildArchiveStatsFromEntries, configureRenderHandlers, draftToMarkdown, handleRenderHtml, handleRenderMarkdown, handleRenderPdf } from "./render.js";
+import { configureCategoryHelpers, defaultCategoryGroups, mergeCategoryMaster, normalizeCategoryGroups, normalizeCategoryMaster, normalizeProposedCategories, readCategoryMaster, writeCategoryMaster } from "./categories.js";
+import { configureDeterministicHandlers, handleClassifyTurnDeterministic, handleMergeThreadTurnsDeterministic, handleRewriteEntryDeterministic, handleSummarizeTurnDeterministic, handleSummarizeUnitDeterministic, handleWriteEntryDeterministic, handleWriteMonthlySummaryDeterministic, handleWriteWeeklySummaryDeterministic, handleWriteYearlySummaryDeterministic } from "./deterministic.js";
 
 const execFileAsync = promisify(execFile);
 let appServerClientPromise = null;
@@ -495,183 +501,6 @@ async function executeTask(runtime, definition, item) {
   }
 }
 
-async function buildTaskMeta(runtime, definition, item) {
-  const readThread = (itemId) => readArtifact(runtime, `artifacts/normalized/${itemId}.json`);
-  switch (definition.taskKey) {
-    case "prepare.extract_export":
-      return { inputHash: hashJson({ zipPath: runtime.config.zipPath, zipStat: fileStat(runtime.config.zipPath) }), promptHash: null, model: null, promptPreview: null };
-    case "prepare.scan_export":
-      return { inputHash: hashJson({ files: walkFiles(runtime.paths.extracted).map((file) => path.relative(runtime.paths.extracted, file).replaceAll("\\", "/")).sort() }), promptHash: null, model: null, promptPreview: null };
-    case "prepare.build_thread_index":
-      return { inputHash: hashJson({ schema: "thread-index-v2", manifest: readArtifact(runtime, "artifacts/manifest/export-manifest.json") || {} }), promptHash: null, model: null, promptPreview: null };
-    case "analyze.normalize_threads":
-      return { inputHash: hashJson(readArtifact(runtime, "artifacts/indexes/thread-index.json") || {}), promptHash: null, model: null, promptPreview: null };
-      case "analyze.attach_images":
-        return { inputHash: hashJson(loadThreads(runtime).map((thread) => ({ itemId: thread.itemId, attachments: thread.messages.reduce((sum, message) => sum + (message.attachments?.length || 0), 0), generatedImages: thread.messages.reduce((sum, message) => sum + (message.generatedImages?.length || 0), 0) }))), promptHash: null, model: null, promptPreview: null };
-      case "ai.generate_category_candidates": {
-        const groups = normalizeCategoryGroups(runtime.config.categoryGroups);
-        return {
-          inputHash: hashJson({ schema: "category-master-v2", groups }),
-          promptHash: null,
-          model: null,
-          promptPreview: null
-        };
-      }
-      case "analyze.split_thread_turns": {
-        const thread = readThread(runtime, item.itemId);
-        return { inputHash: hashJson(thread), promptHash: null, model: null, promptPreview: null };
-      }
-      case "ai.summarize_turn": {
-        const turn = compactTurnForAi(readTurn(runtime, item.itemId));
-        const prompt = renderPromptTemplate("ai.summarize_turn", {
-          payloadJson: JSON.stringify(turn, null, 2)
-        });
-        return aiMeta(runtime, prompt, turn);
-      }
-      case "ai.classify_turn": {
-        const turn = compactTurnForAi(readTurn(runtime, item.itemId));
-        const categories = readCategoryMaster(runtime) || {};
-        const prompt = renderPromptTemplate("ai.classify_thread", {
-          categoryGroupsJson: JSON.stringify(categories.groups || [], null, 2),
-          flatCategoriesJson: JSON.stringify(categories.categories || [], null, 2),
-          payloadJson: JSON.stringify(turn, null, 2)
-        });
-        return aiMeta(runtime, prompt, { categories, turn });
-      }
-      case "ai.merge_thread_turns": {
-        const context = buildThreadMergeContext(runtime, item.itemId);
-        const prompt = buildMergeThreadTurnsPrompt(context.payload);
-        const promptStats = buildPromptStats({ prompt, systemPrompt: getOllamaSystemPrompt(runtime.config) });
-        const tokenLimit = threadMergeInputTokenLimit(runtime);
-        if (promptStats.estimatedInputTokens > tokenLimit) {
-          const templateHash = hashText(renderPromptTemplate("ai.merge_thread_turns", { payloadJson: "" }));
-          const strategy = {
-            mode: "chunked",
-            estimatedInputTokens: promptStats.estimatedInputTokens,
-            tokenLimit,
-            chunkSize: threadMergeChunkSize(runtime),
-            templateHash
-          };
-          return aiMeta(runtime, `chunked ai.merge_thread_turns ${JSON.stringify(strategy)}`, { ...context.input, strategy });
-        }
-        return aiMeta(runtime, prompt, context.input);
-      }
-      case "analyze.group_units":
-        return {
-          inputHash: hashJson({
-            grouping: runtime.config.grouping,
-            targetThreadItemIds: runtime.config.targetThreadItemIds || null,
-            targetDates: runtime.config.targetDates || null,
-            targetWeeks: runtime.config.targetWeeks || null,
-            targetMonths: runtime.config.targetMonths || null,
-            targetYears: runtime.config.targetYears || null,
-            excludeThreadItemIds: runtime.config.excludeThreadItemIds || null,
-            excludeSourceThreadIds: runtime.config.excludeSourceThreadIds || null,
-            excludeGroupIds: runtime.config.excludeGroupIds || null,
-            threads: loadScopedThreadIndex(runtime),
-            classifications: [...loadScopedClassifications(runtime).entries()]
-          }),
-          promptHash: null,
-          model: null,
-          promptPreview: null
-        };
-      case "ai.summarize_unit": {
-        const unit = readUnit(runtime, item.itemId);
-        const availableThreadItemIds = (unit.threadItemIds || []).filter((threadItemId) => hasThreadSummaryInputs(runtime, threadItemId));
-        const payload = {
-          grouping: runtime.config.grouping,
-          unit: compactUnitForAi(unit, availableThreadItemIds),
-          threads: availableThreadItemIds.map((threadItemId) => compactThreadInputsForUnit(runtime, threadItemId)).filter(Boolean)
-        };
-        const prompt = renderPromptTemplate("ai.summarize_unit", {
-          unitId: unit.itemId,
-          unitLabel: unit.label,
-          payloadJson: JSON.stringify(payload, null, 2)
-        });
-        return aiMeta(runtime, prompt, payload);
-      }
-    case "ai.write_diary_entry": {
-      const entry = readEntry(runtime, item.itemId);
-      const payload = compactEntryForAi(entry);
-      const prompt = renderPromptTemplate("ai.write_diary_entry", {
-        entryId: entry.itemId,
-        entryDate: entry.date,
-        entryJson: JSON.stringify(payload, null, 2)
-      });
-      return aiMeta(runtime, prompt, payload);
-    }
-    case "ai.rewrite_diary_entry": {
-      const draft = readArtifact(runtime, `artifacts/ai/diary_drafts/${item.itemId}.json`) || {};
-      const payload = compactDiaryDraftForAi(draft);
-      const prompt = renderPromptTemplate("ai.rewrite_diary_entry", {
-        draftJson: JSON.stringify(payload, null, 2)
-      });
-      return aiMeta(runtime, prompt, payload);
-    }
-    case "ai.write_weekly_summary": {
-      const weekInput = readWeekInput(runtime, item.itemId);
-      const payload = {
-        week: weekInput.week,
-        stats: compactArchiveStatsForAi(weekInput.stats),
-        entries: weekInput.entries.map((entry) => compactDiaryEntryForArchiveSummary(entry))
-      };
-      const prompt = renderPromptTemplate("ai.write_weekly_summary", {
-        weekId: item.itemId,
-        week: weekInput.week,
-        weekJson: JSON.stringify(payload, null, 2)
-      });
-      return aiMeta(runtime, prompt, payload);
-    }
-    case "ai.write_monthly_summary": {
-      const monthInput = readMonthInput(runtime, item.itemId);
-      const payload = {
-        month: monthInput.month,
-        stats: compactArchiveStatsForAi(monthInput.stats),
-        weeks: monthInput.weeklySummaries.map((summary) => compactWeekSummaryForMonthlySummary(summary))
-      };
-      const prompt = renderPromptTemplate("ai.write_monthly_summary", {
-        monthId: item.itemId,
-        month: monthInput.month,
-        monthJson: JSON.stringify(payload, null, 2)
-      });
-      return aiMeta(runtime, prompt, payload);
-    }
-    case "ai.write_yearly_summary": {
-      const yearInput = readYearInput(runtime, item.itemId);
-      const payload = {
-        year: yearInput.year,
-        stats: compactArchiveStatsForAi(yearInput.stats),
-        months: yearInput.monthlySummaries.map((summary) => compactMonthSummaryForYearlySummary(summary))
-      };
-      const prompt = renderPromptTemplate("ai.write_yearly_summary", {
-        yearId: item.itemId,
-        year: yearInput.year,
-        yearJson: JSON.stringify(payload, null, 2)
-      });
-      return aiMeta(runtime, prompt, payload);
-    }
-    case "render.markdown":
-      return { inputHash: hashJson({ grouping: runtime.config.grouping, entries: loadDiaryEntries(runtime), weeklySummaries: loadWeeklySummaries(runtime), monthlySummaries: loadMonthlySummaries(runtime), yearlySummaries: loadYearlySummaries(runtime) }), promptHash: null, model: null, promptPreview: null };
-    case "render.html":
-      return { inputHash: hashJson(readArtifact(runtime, "artifacts/render/diary.json") || {}), promptHash: null, model: null, promptPreview: null };
-    case "render.pdf":
-      return { inputHash: hashJson(fileStat(path.join(runtime.paths.root, "artifacts", "render", "diary.html"))), promptHash: null, model: null, promptPreview: null };
-    default:
-      return { inputHash: hashJson({ taskKey: definition.taskKey, itemId: item.itemId }), promptHash: null, model: null, promptPreview: null };
-  }
-}
-
-function aiMeta(runtime, prompt, input) {
-  return {
-    prompt,
-    input,
-    inputHash: hashJson(input),
-    promptHash: hashText(prompt),
-    model: resolveModelForTask(runtime, runtime.current.taskKey),
-    think: resolveThinkForTask(runtime, runtime.current.taskKey),
-    promptPreview: clip(prompt.replace(/\s+/g, " "), 220)
-  };
-}
 
 function aiProviderLabel(runtime) {
   const provider = resolveRuntimeProvider(runtime.config);
@@ -730,6 +559,22 @@ function buildAiMeta(runtime, meta, response, extra = {}) {
     provider: aiProviderLabel(runtime),
     cacheHit: Boolean(response?.cacheHit),
     ...(usage ? { usage } : {}),
+    ...extra
+  };
+}
+
+function isDeterministicAiMode(runtime) {
+  return runtime.config.aiMode === "deterministic";
+}
+
+function buildLocalAiMeta(_runtime, meta, extra = {}) {
+  return {
+    model: meta.model ?? null,
+    think: meta.think ?? null,
+    promptHash: meta.promptHash ?? null,
+    inputHash: meta.inputHash,
+    provider: "local-deterministic",
+    cacheHit: false,
     ...extra
   };
 }
@@ -1037,201 +882,6 @@ function serializeThreadGroupsForAi(thread, groups) {
 
 function threadSplitPlanPath(runtime, taskKey, itemId) {
   return path.join(runtime.paths.root, "artifacts", "chunks", taskKey, `${itemId}.json`);
-}
-
-function readCategoryMaster(runtime) {
-  const value = readArtifact(runtime, "artifacts/ai/category_master.json") || readArtifact(runtime, "artifacts/ai/categories.json") || null;
-  return value ? normalizeCategoryMaster(runtime, value) : null;
-}
-
-function writeCategoryMaster(runtime, value) {
-  const normalized = normalizeCategoryMaster(runtime, value);
-  writeArtifact(runtime, "artifacts/ai/category_master.json", normalized);
-  writeArtifact(runtime, "artifacts/ai/categories.json", normalized);
-}
-
-function readCategorySuggestions(runtime) {
-  return readArtifact(runtime, "artifacts/ai/category_suggestions.json") || { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, items: [] };
-}
-
-function writeCategorySuggestions(runtime, value) {
-  writeArtifact(runtime, "artifacts/ai/category_suggestions.json", value);
-}
-
-function defaultCategoryGroups() {
-  return [
-    { id: "work", label: "仕事", description: "仕事として進めた依頼、業務、調査、制作に関するまとまり。", keywords: ["仕事", "業務", "依頼"] },
-    { id: "technology", label: "技術", description: "プログラミング、ツール、AI、システム利用に関するまとまり。", keywords: ["技術", "開発", "AI"] },
-    { id: "research-learning", label: "調査・学習", description: "概念の理解、比較、調査、知識整理に関するまとまり。", keywords: ["調査", "学習", "理解"] },
-    { id: "creative-media", label: "創作・メディア", description: "物語、作品、文章、表現の検討に関するまとまり。", keywords: ["創作", "作品", "文章"] },
-    { id: "life", label: "生活", description: "日常生活、健康、買い物、趣味に関するまとまり。", keywords: ["生活", "健康", "趣味"] },
-    { id: "other", label: "その他", description: "上記の大カテゴリに明確に収まらないまとまり。", keywords: ["その他"] }
-  ];
-}
-
-function normalizeCategoryGroups(groups) {
-  const input = Array.isArray(groups) && groups.length ? groups : defaultCategoryGroups();
-  const seen = new Set();
-  const result = [];
-  for (const item of input) {
-    if (!item || typeof item !== "object") continue;
-    const id = sanitizeId(String(item.id || item.label || "").trim()).toLowerCase();
-    const label = String(item.label || "").trim();
-    if (!id || !label || seen.has(id)) continue;
-    seen.add(id);
-    result.push({
-      id,
-      label,
-      description: String(item.description || "").trim() || `${label} に関する大カテゴリ。`,
-      keywords: uniqueStrings(Array.isArray(item.keywords) ? item.keywords : []).slice(0, 6)
-    });
-  }
-  return result.length ? result : defaultCategoryGroups();
-}
-
-function normalizeCategoryMaster(runtime, value) {
-  const configuredGroups = normalizeCategoryGroups(runtime.config.categoryGroups);
-  const existingGroups = Array.isArray(value?.groups) ? value.groups : [];
-  const legacyCategories = Array.isArray(value?.categories) ? value.categories : [];
-  const mergedGroups = configuredGroups.map((configured) => {
-    const matched = existingGroups.find((group) => sanitizeId(String(group?.id || "")).toLowerCase() === configured.id);
-    const categories = Array.isArray(matched?.categories)
-      ? matched.categories
-      : configured.id === "other"
-        ? legacyCategories
-        : [];
-    return {
-      id: configured.id,
-      label: configured.label,
-      description: configured.description,
-      keywords: configured.keywords,
-      categories: normalizeChildCategories(categories, configured)
-    };
-  });
-  const flatCategories = mergedGroups.flatMap((group) => group.categories.map((category) => ({
-    id: category.id,
-    label: category.label,
-    description: category.description,
-    keywords: category.keywords,
-    groupId: group.id,
-    groupLabel: group.label
-  })));
-  return {
-    schemaVersion: 2,
-    generatedAt: value?.generatedAt || isoJst(),
-    runId: value?.runId || runtime.config.runId,
-    groups: mergedGroups,
-    categories: flatCategories,
-    aiMeta: value?.aiMeta || null,
-    updatedBy: value?.updatedBy || null
-  };
-}
-
-function normalizeChildCategories(categories, group) {
-  const seen = new Set();
-  const result = [];
-  for (const item of categories || []) {
-    if (!item || typeof item !== "object") continue;
-    const label = String(item.label || "").trim();
-    const id = sanitizeId(String(item.id || label).trim()).toLowerCase();
-    if (!id || !label || seen.has(id)) continue;
-    seen.add(id);
-    result.push({
-      id,
-      label,
-      description: String(item.description || "").trim() || `${group.label} 配下の ${label} に関するカテゴリ。`,
-      keywords: uniqueStrings(Array.isArray(item.keywords) ? item.keywords : []).slice(0, 6)
-    });
-  }
-  return result;
-}
-
-function normalizeProposedCategories(items) {
-  const result = [];
-  const seen = new Set();
-  for (const item of items || []) {
-    if (!item || typeof item !== "object") continue;
-    const label = String(item.label || "").trim();
-    const rawId = String(item.id || label).trim();
-    const id = sanitizeId(rawId).toLowerCase();
-    const groupId = sanitizeId(String(item.groupId || item.primaryGroup || "").trim()).toLowerCase();
-    if (!id || !label || !groupId || seen.has(`${groupId}:${id}`)) continue;
-    seen.add(`${groupId}:${id}`);
-    result.push({
-      groupId,
-      id,
-      label,
-      description: String(item.description || "").trim() || `${label} に関する話題を分類するカテゴリ。`,
-      keywords: uniqueStrings(Array.isArray(item.keywords) ? item.keywords : [])
-    });
-  }
-  return result;
-}
-
-function mergeCategoryMaster(runtime, proposedCategories, itemId = null) {
-  const normalized = normalizeProposedCategories(proposedCategories);
-  if (!normalized.length) {
-    return false;
-  }
-  if (runtime.config.freezeCategories) {
-    return false;
-  }
-  const currentSuggestions = readCategorySuggestions(runtime);
-  const suggestionItems = Array.isArray(currentSuggestions.items) ? currentSuggestions.items : [];
-  for (const category of normalized) {
-    suggestionItems.push({
-      groupId: category.groupId,
-      id: category.id,
-      label: category.label,
-      description: category.description,
-      keywords: category.keywords,
-      sourceTaskKey: runtime.current.taskKey,
-      sourceItemId: itemId,
-      adoptedAt: isoJst()
-    });
-  }
-  writeCategorySuggestions(runtime, {
-    schemaVersion: 1,
-    generatedAt: isoJst(),
-    runId: runtime.config.runId,
-    items: suggestionItems
-  });
-  const current = readCategoryMaster(runtime) || normalizeCategoryMaster(runtime, { schemaVersion: 2, generatedAt: isoJst(), runId: runtime.config.runId, groups: [] });
-  const groups = Array.isArray(current.groups) ? current.groups.map((group) => ({ ...group, categories: [...(group.categories || [])] })) : [];
-  let changed = false;
-  for (const category of normalized) {
-    const group = groups.find((entry) => entry.id === category.groupId);
-    if (!group) {
-      continue;
-    }
-    if (group.categories.some((entry) => entry.id === category.id || entry.label === category.label)) {
-      continue;
-    }
-    group.categories.push({
-      id: category.id,
-      label: category.label,
-      description: category.description,
-      keywords: category.keywords
-    });
-    changed = true;
-  }
-  if (!changed) {
-    return false;
-  }
-  writeCategoryMaster(runtime, {
-    ...current,
-    schemaVersion: 2,
-    generatedAt: isoJst(),
-    runId: runtime.config.runId,
-    groups,
-    updatedBy: itemId ? { taskKey: runtime.current.taskKey, itemId, at: isoJst() } : current.updatedBy || null
-  });
-  if (itemId) {
-    const note = `新しい中カテゴリを category master に追加しました (${normalized.map((category) => `${category.groupId}/${category.id}`).join(", ")})`;
-    emitEvent(runtime, { type: "category_master.updated", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, itemId, taskInstanceId: runtime.current.taskInstanceId, note });
-    logConsole("cat  ", `${runtime.current.taskKey}__${itemId}`, note);
-  }
-  return true;
 }
 
 function readThreadSplitPlan(runtime, taskKey, itemId) {
@@ -1727,336 +1377,6 @@ function readYearInput(runtime, yearItemId) {
   return { itemId: yearItemId, year, months, monthlySummaries, entries, stats: buildArchiveStatsFromEntries(runtime, entries, { monthCount: months.length }) };
 }
 
-function resolveDependsOn(runtime, taskKey, itemId) {
-  if (taskKey === "prepare.extract_export") return [];
-  if (taskKey === "prepare.scan_export") return [taskInstanceId("prepare.extract_export", "run")];
-  if (taskKey === "prepare.build_thread_index") return [taskInstanceId("prepare.scan_export", "run")];
-  if (taskKey === "analyze.normalize_threads") return [taskInstanceId("prepare.build_thread_index", "run")];
-  if (taskKey === "analyze.attach_images") return [taskInstanceId("analyze.normalize_threads", "run")];
-  if (taskKey === "ai.generate_category_candidates") return [taskInstanceId("analyze.attach_images", "run")];
-  if (taskKey === "analyze.split_thread_turns") return [taskInstanceId("analyze.attach_images", "run")];
-  if (taskKey === "ai.summarize_turn") return [taskInstanceId("analyze.split_thread_turns", readTurn(runtime, itemId).threadItemId)];
-  if (taskKey === "ai.classify_turn") return [taskInstanceId("analyze.split_thread_turns", readTurn(runtime, itemId).threadItemId), taskInstanceId("ai.generate_category_candidates", "run")];
-  if (taskKey === "ai.merge_thread_turns") return loadTurnsForThread(runtime, itemId).flatMap((turn) => [taskInstanceId("ai.summarize_turn", turn.itemId), taskInstanceId("ai.classify_turn", turn.itemId)]);
-  if (taskKey === "analyze.group_units") return (readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || [])
-    .filter((thread) => threadMatchesTargetScopes(thread, runtime.config))
-    .map((thread) => taskInstanceId("ai.merge_thread_turns", thread.itemId));
-  if (taskKey === "ai.summarize_unit") return readUnit(runtime, itemId).threadItemIds.filter((threadItemId) => hasThreadSummaryInputs(runtime, threadItemId)).map((threadItemId) => taskInstanceId("ai.merge_thread_turns", threadItemId));
-  if (taskKey === "ai.write_diary_entry") return readEntry(runtime, itemId).unitSummaries.map((unitSummary) => taskInstanceId("ai.summarize_unit", unitSummary.itemId));
-  if (taskKey === "ai.rewrite_diary_entry") return [taskInstanceId("ai.write_diary_entry", itemId)];
-  if (taskKey === "ai.write_weekly_summary") return readWeekInput(runtime, itemId).entries.map((entry) => taskInstanceId("ai.rewrite_diary_entry", entry.itemId));
-  if (taskKey === "ai.write_monthly_summary") return readMonthInput(runtime, itemId).weeks.map((week) => taskInstanceId("ai.write_weekly_summary", `week_${week}`));
-  if (taskKey === "ai.write_yearly_summary") return readYearInput(runtime, itemId).months.map((month) => taskInstanceId("ai.write_monthly_summary", `month_${month}`));
-  if (taskKey === "render.markdown") return [...loadDiaryEntries(runtime).map((entry) => taskInstanceId("ai.rewrite_diary_entry", entry.itemId)), ...enumerateWeekItems(runtime).map((item) => taskInstanceId("ai.write_weekly_summary", item.itemId)), ...enumerateMonthItems(runtime).map((item) => taskInstanceId("ai.write_monthly_summary", item.itemId)), ...enumerateYearItems(runtime).map((item) => taskInstanceId("ai.write_yearly_summary", item.itemId))];
-  if (taskKey === "render.html") return [taskInstanceId("render.markdown", "run")];
-  if (taskKey === "render.pdf") return [taskInstanceId("render.html", "run")];
-  return [];
-}
-
-function reusable(state, runtime, definition, item, meta, dependsOn, invalidation) {
-  if (runtime.config.force || !state || state.status !== "completed") return false;
-  if (shouldRerunExplicitSelection(runtime, definition, item)) return false;
-  if (invalidation) return false;
-  if (isPersistentAiTask(definition)) return hasArtifacts(runtime, state.artifactPaths);
-  if (runtime.config.skipCompleted) return hasArtifacts(runtime, state.artifactPaths);
-  if (state.inputHash !== meta.inputHash) return false;
-  if (definition.isAi && (state.promptHash !== meta.promptHash || state.model !== meta.model)) return false;
-  if (!sameArray(state.dependsOn || [], dependsOn)) return false;
-  return hasArtifacts(runtime, state.artifactPaths);
-}
-
-function getInvalidation(runtime, definition, item, state, meta, dependsOn) {
-  if (!state) {
-    return null;
-  }
-  if (runtime.config.force) {
-    return { reason: "--force により再実行します" };
-  }
-  if (shouldRerunExplicitSelection(runtime, definition, item)) {
-    if (shouldRerunExplicitItem(runtime, item)) {
-      return { reason: "--item-id 指定により対象 item を再実行します" };
-    }
-    if (shouldRerunExplicitDate(runtime, definition, item)) {
-      return { reason: `--date ${runtime.config.date} 指定により対象日付を再実行します` };
-    }
-  }
-  if (state.status === "running") {
-    return { reason: "前回実行が running のまま終了していたため再実行します" };
-  }
-  if (state.status === "failed") {
-    return { reason: runtime.config.retryFailed ? "failed task を再試行します" : "failed task を再実行します" };
-  }
-  if (state.status === "completed" && isPersistentAiTask(definition)) {
-    if (!hasArtifacts(runtime, state.artifactPaths)) {
-      return { reason: "必要 artifact が欠落しているため再実行します" };
-    }
-    return null;
-  }
-  if (runtime.changed.size > 0 && dependsOn.some((dependency) => runtime.changed.has(dependency) || runtime.invalidated.has(dependency))) {
-    return { reason: "依存 task が変更されたため再実行します" };
-  }
-  if (state.status === "completed") {
-    if (!hasArtifacts(runtime, state.artifactPaths)) {
-      return { reason: "必要 artifact が欠落しているため再実行します" };
-    }
-    if (state.inputHash !== meta.inputHash) {
-      return { reason: "inputHash が変化したため再実行します" };
-    }
-    if (definition.isAi && state.promptHash !== meta.promptHash) {
-      return { reason: "promptHash が変化したため再実行します" };
-    }
-    if (definition.isAi && state.model !== meta.model) {
-      return { reason: "model が変化したため再実行します" };
-    }
-    if (!sameArray(state.dependsOn || [], dependsOn)) {
-      return { reason: "dependsOn が変化したため再実行します" };
-    }
-  }
-  return null;
-}
-
-function isPersistentAiTask(definition) {
-  return Boolean(definition?.isAi && [
-    "ai.summarize_turn",
-    "ai.classify_turn",
-    "ai.merge_thread_turns",
-    "ai.summarize_unit",
-    "ai.write_diary_entry",
-    "ai.rewrite_diary_entry",
-    "ai.write_weekly_summary",
-    "ai.write_monthly_summary",
-    "ai.write_yearly_summary"
-  ].includes(definition.taskKey));
-}
-
-function hasArtifacts(runtime, artifactPaths) {
-  return Array.isArray(artifactPaths) && artifactPaths.length > 0 && artifactPaths.every((relativePath) => fs.existsSync(path.join(runtime.paths.root, relativePath)));
-}
-
-function migrateReusableState(runtime, definition, item, state, meta, dependsOn) {
-  if (!state || state.status !== "completed") {
-    return null;
-  }
-  if (!hasArtifacts(runtime, state.artifactPaths)) {
-    return null;
-  }
-  if (definition.taskKey === "ai.classify_thread" && runtime.config.freezeCategories) {
-    const legacyDependency = taskInstanceId("ai.generate_category_candidates", "run");
-    const currentDependsOn = Array.isArray(state.dependsOn) ? state.dependsOn : [];
-    const withoutLegacy = currentDependsOn.filter((dependency) => dependency !== legacyDependency);
-    const canMigrate = currentDependsOn.includes(legacyDependency)
-      && sameArray(withoutLegacy, dependsOn)
-      && state.model === meta.model
-      && state.promptHash === meta.promptHash
-      && state.inputHash === meta.inputHash;
-    if (canMigrate) {
-      const nextState = { ...state, dependsOn };
-      writeState(runtime, definition, item.itemId, nextState);
-      return {
-        state: nextState,
-        note: "過去の分類成果物を freezeCategories 互換の state に変換して再利用します"
-      };
-    }
-    const classificationArtifact = readArtifact(runtime, `artifacts/ai/thread_classification/${item.itemId}.json`);
-    const categoryIds = new Set((readCategoryMaster(runtime)?.categories || []).map((category) => category.id));
-      const usedCategoryIds = [classificationArtifact?.primaryCategory || classificationArtifact?.primary, ...((classificationArtifact?.secondaryCategories || classificationArtifact?.secondary || []))].filter(Boolean);
-    const canCompatMigrate = classificationArtifact
-      && state.model === meta.model
-      && usedCategoryIds.length > 0
-      && usedCategoryIds.every((categoryId) => categoryIds.has(categoryId));
-    if (canCompatMigrate) {
-      const nextState = {
-        ...state,
-        dependsOn,
-        inputHash: meta.inputHash,
-        promptHash: meta.promptHash
-      };
-      writeState(runtime, definition, item.itemId, nextState);
-      return {
-        state: nextState,
-        note: "過去の分類成果物を互換変換して再利用します"
-      };
-    }
-  }
-  return null;
-}
-
-function validateRunOptions(runtime) {
-  if (!["task", "date"].includes(runtime.config.executionOrder || "task")) {
-    throw new Error(`executionOrder は task または date で指定してください: ${runtime.config.executionOrder}`);
-  }
-  if (runtime.config.date && !/^\d{4}-\d{2}-\d{2}$/.test(runtime.config.date)) {
-    throw new Error(`--date の形式が不正です: ${runtime.config.date}`);
-  }
-  for (const value of runtime.config.targetDates || []) {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
-      throw new Error(`targetDates の形式が不正です: ${value}`);
-    }
-  }
-  for (const value of runtime.config.targetWeeks || []) {
-    if (!/^\d{4}-\d{2}-W[1-5]$/.test(value)) {
-      throw new Error(`targetWeeks の形式が不正です: ${value}`);
-    }
-  }
-  for (const value of runtime.config.targetMonths || []) {
-    if (!/^\d{4}-\d{2}$/.test(value)) {
-      throw new Error(`targetMonths の形式が不正です: ${value}`);
-    }
-  }
-  for (const value of runtime.config.targetYears || []) {
-    if (!/^\d{4}$/.test(value)) {
-      throw new Error(`targetYears の形式が不正です: ${value}`);
-    }
-  }
-  if (runtime.config.limit !== null && runtime.config.limit <= 0) {
-    throw new Error(`--limit は 1 以上で指定してください: ${runtime.config.limit}`);
-  }
-  if (runtime.config.jsonRetryAttempts !== null && runtime.config.jsonRetryAttempts < 1) {
-    throw new Error(`jsonRetryAttempts は 1 以上で指定してください: ${runtime.config.jsonRetryAttempts}`);
-  }
-  if (runtime.config.date && runtime.config.grouping === "category") {
-    throw new Error("--group-by category では --date は指定できません。");
-  }
-  if (runtime.config.targetThreadItemIds && !Array.isArray(runtime.config.targetThreadItemIds)) {
-    throw new Error("targetThreadItemIds は配列で指定してください。");
-  }
-  for (const key of ["excludeThreadItemIds", "excludeSourceThreadIds", "excludeGroupIds"]) {
-    if (runtime.config[key] && !Array.isArray(runtime.config[key])) {
-      throw new Error(`${key} は配列で指定してください。`);
-    }
-  }
-  if (runtime.config.rerunScopes?.length) {
-    const invalid = runtime.config.rerunScopes.filter((scope) => !["thread", "unit"].includes(scope));
-    if (invalid.length) {
-      throw new Error(`rerunScopes には thread, unit のみ指定できます: ${invalid.join(", ")}`);
-    }
-  }
-}
-
-function applyItemFilters(runtime, definition, items) {
-  if (!matchesOnly(runtime, definition.taskKey)) {
-    return [];
-  }
-
-  let filtered = [...items];
-  if (runtime.config.itemIds?.length) {
-    const allow = new Set(runtime.config.itemIds);
-    filtered = filtered.filter((item) => allow.has(item.itemId));
-  }
-  if (hasThreadFilterScope(runtime.config)) {
-    filtered = filtered.filter((item) => matchesTargetThreadFilter(runtime, definition.itemType, item.meta || item));
-  }
-  if (runtime.config.date) {
-    filtered = filtered.filter((item) => matchesDateFilter(definition.itemType, item.meta || item, runtime.config.date));
-  }
-  if (runtime.config.limit && definition.itemType !== "run") {
-    filtered = filtered.slice(0, runtime.config.limit);
-  }
-  return filtered;
-}
-
-function matchesOnly(runtime, taskKey) {
-  if (runtime.config.rerunScopes?.length && !matchesRerunScope(taskKey, runtime.config.rerunScopes)) {
-    return false;
-  }
-  if (!runtime.config.only?.length) {
-    return true;
-  }
-  return runtime.config.only.some((pattern) => taskKey === pattern || taskKey.startsWith(`${pattern}.`) || taskKey.startsWith(pattern));
-}
-
-function shouldRerunExplicitItem(runtime, item) {
-  return Boolean(item?.itemId && runtime.config.itemIds?.length && runtime.config.itemIds.includes(item.itemId));
-}
-
-function shouldRerunExplicitSelection(runtime, definition, item) {
-  return shouldRerunExplicitItem(runtime, item) || shouldRerunExplicitDate(runtime, definition, item);
-}
-
-function shouldRerunExplicitDate(runtime, definition, item) {
-  if (!runtime.config.date) {
-    return false;
-  }
-  if (runtime.config.rerunScopes?.length && !matchesRerunScope(definition.taskKey, runtime.config.rerunScopes)) {
-    return false;
-  }
-  const meta = item?.meta || item;
-  if (definition.itemType === "run") {
-    return ["analyze.group_units", "render.markdown", "render.html", "render.pdf"].includes(definition.taskKey);
-  }
-  return matchesDateFilter(definition.itemType, meta, runtime.config.date);
-}
-
-function matchesRerunScope(taskKey, scopes) {
-  const allow = new Set(scopes || []);
-  if (!allow.size) {
-    return true;
-  }
-  if (allow.has("thread") && [
-    "analyze.split_thread_turns",
-    "ai.summarize_turn",
-    "ai.classify_turn",
-    "ai.merge_thread_turns"
-  ].includes(taskKey)) {
-    return true;
-  }
-  if (allow.has("unit") && [
-    "analyze.group_units",
-    "ai.summarize_unit",
-    "ai.write_diary_entry",
-    "ai.rewrite_diary_entry",
-    "ai.write_weekly_summary",
-    "ai.write_monthly_summary",
-    "ai.write_yearly_summary",
-    "render.markdown",
-    "render.html",
-    "render.pdf"
-  ].includes(taskKey)) {
-    return true;
-  }
-  return false;
-}
-
-function matchesTargetThreadFilter(runtime, itemType, meta) {
-  if (!hasThreadFilterScope(runtime.config)) {
-    return true;
-  }
-  if (itemType === "run") {
-    return true;
-  }
-  if (itemType === "thread") {
-    return threadMatchesTargetScopes(meta, runtime.config);
-  }
-  if (itemType === "turn") {
-    return threadItemMatchesTargetScopes(runtime, meta.threadItemId);
-  }
-  if (itemType === "unit" || itemType === "entry" || itemType === "week" || itemType === "month" || itemType === "year") {
-    return (meta.threadItemIds || []).some((threadItemId) => threadItemMatchesTargetScopes(runtime, threadItemId));
-  }
-  return true;
-}
-
-function matchesDateFilter(itemType, meta, date) {
-  if (itemType === "run") {
-    return true;
-  }
-  if (itemType === "thread") {
-    return meta.primaryDate === date;
-  }
-  if (itemType === "turn") {
-    return meta.date === date;
-  }
-  if (itemType === "week") {
-    return meta.week === monthWeekKey(date);
-  }
-  if (itemType === "month") {
-    return meta.month === date.slice(0, 7);
-  }
-  if (itemType === "year") {
-    return meta.year === date.slice(0, 4);
-  }
-  return meta.date === date || meta.itemId === `entry_${date}` || meta.itemId === `unit_date_${date}`;
-}
 
 async function runHandler(runtime, taskKey, itemId, meta) {
   if (taskKey === "prepare.extract_export") return handleExtractExport(runtime);
@@ -2167,6 +1487,9 @@ function handleSplitThreadTurns(runtime, itemId) {
 }
 
 async function handleSummarizeTurn(runtime, itemId, meta) {
+  if (isDeterministicAiMode(runtime)) {
+    return handleSummarizeTurnDeterministic(runtime, itemId, meta);
+  }
   const response = await askForJson(runtime, "ai.summarize_turn", itemId, `turn-summary-${itemId}`, meta);
   const turn = readTurn(runtime, itemId);
   writeArtifact(runtime, `artifacts/ai/turn_summaries/${itemId}.json`, {
@@ -2187,6 +1510,9 @@ async function handleSummarizeTurn(runtime, itemId, meta) {
 }
 
 async function handleClassifyTurn(runtime, itemId, meta) {
+  if (isDeterministicAiMode(runtime)) {
+    return handleClassifyTurnDeterministic(runtime, itemId, meta);
+  }
   const turn = readTurn(runtime, itemId);
   const categories = readCategoryMaster(runtime) || {};
   const response = await askForJson(runtime, "ai.classify_turn", itemId, `turn-classify-${itemId}`, meta);
@@ -2223,6 +1549,9 @@ async function handleClassifyTurn(runtime, itemId, meta) {
 }
 
 async function handleMergeThreadTurns(runtime, itemId, meta) {
+  if (isDeterministicAiMode(runtime)) {
+    return handleMergeThreadTurnsDeterministic(runtime, itemId, meta);
+  }
   const context = buildThreadMergeContext(runtime, itemId);
   const response = await askForMergedThreadJson(runtime, itemId, meta, context);
   const categories = readCategoryMaster(runtime) || {};
@@ -2545,6 +1874,9 @@ function handleGroupUnits(runtime) {
 }
 
 async function handleSummarizeUnit(runtime, itemId, meta) {
+  if (isDeterministicAiMode(runtime)) {
+    return handleSummarizeUnitDeterministic(runtime, itemId, meta);
+  }
   const response = await askForJson(runtime, "ai.summarize_unit", itemId, `unit-${itemId}`, meta);
   const unit = readUnit(runtime, itemId);
   writeArtifact(runtime, `artifacts/ai/unit_summaries/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, label: unit.label, date: unit.date, category: unit.category, summaryTitle: response.parsed.summaryTitle || unit.label, interests: Array.isArray(response.parsed.interests) ? response.parsed.interests : [], questions: Array.isArray(response.parsed.questions) ? response.parsed.questions : [], outcomes: Array.isArray(response.parsed.outcomes) ? response.parsed.outcomes : [], images: Array.isArray(response.parsed.images) ? response.parsed.images : [], narrative: response.parsed.narrative || "", aiMeta: buildAiMeta(runtime, meta, response) });
@@ -2553,6 +1885,9 @@ async function handleSummarizeUnit(runtime, itemId, meta) {
 }
 
 async function handleWriteEntry(runtime, itemId, meta) {
+  if (isDeterministicAiMode(runtime)) {
+    return handleWriteEntryDeterministic(runtime, itemId, meta);
+  }
   const response = await askForJson(runtime, "ai.write_diary_entry", itemId, `entry-draft-${itemId}`, meta);
   const entry = readEntry(runtime, itemId);
   writeArtifact(runtime, `artifacts/ai/diary_drafts/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, date: entry.date, title: response.parsed.title || `${entry.date} の日記`, lead: response.parsed.lead || "", sections: Array.isArray(response.parsed.sections) ? response.parsed.sections : [], closing: response.parsed.closing || "", images: Array.isArray(response.parsed.images) ? response.parsed.images : [], aiMeta: buildAiMeta(runtime, meta, response) });
@@ -2561,6 +1896,9 @@ async function handleWriteEntry(runtime, itemId, meta) {
 }
 
 async function handleRewriteEntry(runtime, itemId, meta) {
+  if (isDeterministicAiMode(runtime)) {
+    return handleRewriteEntryDeterministic(runtime, itemId, meta);
+  }
   const response = await askForJson(runtime, "ai.rewrite_diary_entry", itemId, `entry-final-${itemId}`, meta);
   const draft = readArtifact(runtime, `artifacts/ai/diary_drafts/${itemId}.json`) || {};
   writeArtifact(runtime, `artifacts/ai/diary_entries/${itemId}.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, itemId, date: draft.date, title: response.parsed.title || draft.title, markdownBody: response.parsed.markdownBody || draftToMarkdown(draft), images: Array.isArray(response.parsed.images) ? response.parsed.images : draft.images || [], aiMeta: buildAiMeta(runtime, meta, response) });
@@ -2569,6 +1907,9 @@ async function handleRewriteEntry(runtime, itemId, meta) {
 }
 
 async function handleWriteWeeklySummary(runtime, itemId, meta) {
+  if (isDeterministicAiMode(runtime)) {
+    return handleWriteWeeklySummaryDeterministic(runtime, itemId, meta);
+  }
   const response = await askForJson(runtime, "ai.write_weekly_summary", itemId, `weekly-summary-${itemId}`, meta);
   const weekInput = readWeekInput(runtime, itemId);
   writeArtifact(runtime, `artifacts/ai/weekly_summaries/${itemId}.json`, {
@@ -2591,6 +1932,9 @@ async function handleWriteWeeklySummary(runtime, itemId, meta) {
 }
 
 async function handleWriteMonthlySummary(runtime, itemId, meta) {
+  if (isDeterministicAiMode(runtime)) {
+    return handleWriteMonthlySummaryDeterministic(runtime, itemId, meta);
+  }
   const response = await askForJson(runtime, "ai.write_monthly_summary", itemId, `monthly-summary-${itemId}`, meta);
   const monthInput = readMonthInput(runtime, itemId);
   writeArtifact(runtime, `artifacts/ai/monthly_summaries/${itemId}.json`, {
@@ -2614,6 +1958,9 @@ async function handleWriteMonthlySummary(runtime, itemId, meta) {
 }
 
 async function handleWriteYearlySummary(runtime, itemId, meta) {
+  if (isDeterministicAiMode(runtime)) {
+    return handleWriteYearlySummaryDeterministic(runtime, itemId, meta);
+  }
   const response = await askForJson(runtime, "ai.write_yearly_summary", itemId, `yearly-summary-${itemId}`, meta);
   const yearInput = readYearInput(runtime, itemId);
   writeArtifact(runtime, `artifacts/ai/yearly_summaries/${itemId}.json`, {
@@ -2633,70 +1980,6 @@ async function handleWriteYearlySummary(runtime, itemId, meta) {
   });
   writeRaw(runtime, "ai.write_yearly_summary", itemId, response.text, response.usage);
   return [`artifacts/ai/yearly_summaries/${itemId}.json`, `artifacts/raw/ai.write_yearly_summary/${itemId}.raw.json`];
-}
-
-function handleRenderMarkdown(runtime) {
-  const entries = loadDiaryEntries(runtime).sort((a, b) => (a.date || "").localeCompare(b.date || "", "ja"));
-  const posts = writeRenderPostsMarkdown(runtime, entries);
-  const archives = writeRenderArchivesMarkdown(runtime, posts);
-  writeArtifact(runtime, "artifacts/render/diary.json", { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, grouping: runtime.config.grouping, entries, posts, weeks: archives.weeks, months: archives.months, years: archives.years });
-  writeArtifact(runtime, "artifacts/render/posts.json", { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, posts });
-  writeArtifact(runtime, "artifacts/render/weeks.json", { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, weeks: archives.weeks });
-  writeArtifact(runtime, "artifacts/render/months.json", { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, months: archives.months });
-  writeArtifact(runtime, "artifacts/render/years.json", { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, years: archives.years });
-  const markdown = ["# Nikki Diary", "", `- 生成日時: ${isoJst()}`, `- 集計単位: ${runtime.config.grouping}`, "", ...entries.flatMap((entry) => [`## ${entry.title || entry.itemId}`, "", entry.date ? `- 日付: ${entry.date}` : "", entry.date ? "" : "", entry.markdownBody || "", ""])].join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
-  fs.writeFileSync(path.join(runtime.paths.root, "artifacts", "render", "diary.md"), markdown, "utf8");
-  const indexMarkdown = buildRenderIndexMarkdown(posts, archives.weeks, archives.months, archives.years);
-  fs.writeFileSync(path.join(runtime.paths.root, "artifacts", "render", "index.md"), indexMarkdown, "utf8");
-  return ["artifacts/render/diary.json", "artifacts/render/posts.json", "artifacts/render/weeks.json", "artifacts/render/months.json", "artifacts/render/years.json", "artifacts/render/diary.md", "artifacts/render/index.md", ...posts.map((post) => post.markdownPath), ...archives.weeks.map((week) => week.markdownPath), ...archives.months.map((month) => month.markdownPath), ...archives.years.map((year) => year.markdownPath)];
-}
-
-function handleRenderHtml(runtime) {
-  const markdown = fs.readFileSync(path.join(runtime.paths.root, "artifacts", "render", "diary.md"), "utf8");
-  fs.writeFileSync(path.join(runtime.paths.root, "artifacts", "render", "diary.html"), wrapHtml(marked.parse(markdown)), "utf8");
-  const posts = readArtifact(runtime, "artifacts/render/posts.json")?.posts || [];
-  const weeks = readArtifact(runtime, "artifacts/render/weeks.json")?.weeks || [];
-  const months = readArtifact(runtime, "artifacts/render/months.json")?.months || [];
-  const years = readArtifact(runtime, "artifacts/render/years.json")?.years || [];
-  const changedEntryIds = getChangedEntryIds(runtime);
-  fs.writeFileSync(path.join(runtime.paths.root, "artifacts", "render", "index.html"), wrapBlogIndexHtml(posts, weeks, months, years), "utf8");
-  for (const post of posts) {
-    if (changedEntryIds.size > 0 && !changedEntryIds.has(post.entryId) && fs.existsSync(path.join(runtime.paths.root, post.htmlPath))) {
-      continue;
-    }
-    const entry = readArtifact(runtime, `artifacts/ai/diary_entries/${post.entryId}.json`) || {};
-    fs.writeFileSync(path.join(runtime.paths.root, post.htmlPath), wrapBlogPostHtml(post, entry, posts, weeks, months, years), "utf8");
-  }
-  for (const week of weeks) {
-    fs.writeFileSync(path.join(runtime.paths.root, week.htmlPath), wrapBlogWeekHtml(week, posts, weeks, months, years), "utf8");
-  }
-  for (const month of months) {
-    fs.writeFileSync(path.join(runtime.paths.root, month.htmlPath), wrapBlogMonthHtml(month, posts, weeks, months, years), "utf8");
-  }
-  for (const year of years) {
-    fs.writeFileSync(path.join(runtime.paths.root, year.htmlPath), wrapBlogYearHtml(year, posts, weeks, months, years), "utf8");
-  }
-  return ["artifacts/render/diary.html", "artifacts/render/index.html", ...posts.map((post) => post.htmlPath), ...weeks.map((week) => week.htmlPath), ...months.map((month) => month.htmlPath), ...years.map((year) => year.htmlPath)];
-}
-
-async function handleRenderPdf(runtime) {
-  const htmlPath = path.join(runtime.paths.root, "artifacts", "render", "diary.html");
-  const pdfPath = path.join(runtime.paths.root, "artifacts", "render", "diary.pdf");
-  const browserPath = await findChromiumBrowser();
-  let pdfGenerated = false;
-  let pdfError = null;
-  if (browserPath) {
-    try {
-      await execFileAsync(browserPath, ["--headless", "--disable-gpu", `--print-to-pdf=${pdfPath}`, fileUrl(htmlPath)], { windowsHide: true, timeout: 120000, maxBuffer: 1024 * 1024 * 16 });
-      pdfGenerated = fs.existsSync(pdfPath);
-    } catch (error) {
-      pdfError = error instanceof Error ? error.message : String(error);
-    }
-  } else {
-    pdfError = "Edge / Chrome が見つからなかったため PDF は未生成です。";
-  }
-  writeArtifact(runtime, "artifacts/render/render-info.json", { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, pdfGenerated, pdfError });
-  return pdfGenerated ? ["artifacts/render/render-info.json", "artifacts/render/diary.pdf"] : ["artifacts/render/render-info.json"];
 }
 
 function loadRawThreads(extractDir) {
@@ -2737,406 +2020,12 @@ function buildImageIndex(extractDir) {
   return { byId };
 }
 
-async function askForJson(runtime, taskKey, itemId, name, meta) {
-  const dir = path.join(runtime.paths.root, ".codex-temp");
-  ensureDir(dir);
-  const cacheKey = aiCacheKey(taskKey, meta);
-  const cachePath = path.join(runtime.paths.cache, `${cacheKey}.json`);
-  const cached = readJson(cachePath);
-  if (cached?.text) {
-    emitEvent(runtime, { type: "task.cache_hit", stage: runtime.current.stage, taskKey, itemType: runtime.current.itemType, itemId, taskInstanceId: runtime.current.taskInstanceId, note: "AI cache を再利用しました" });
-    writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: meta.promptPreview, sentAt: cached.cachedAt || null, note: "AI cache を再利用しました", lastEvent: "task.cache_hit" });
-    return { text: cached.text, parsed: cached.parsed, usage: cached.usage || null, cacheHit: true };
-  }
-  const client = await getAppServerClient(runtime.config);
-  const maxParseAttempts = Number(runtime.config.jsonRetryAttempts || 2);
-  for (let parseAttempt = 1; parseAttempt <= maxParseAttempts; parseAttempt += 1) {
-    const prompt = parseAttempt === 1 ? meta.prompt : buildJsonRepairPrompt(meta.prompt);
-    const promptPath = path.join(dir, `${name.replace(/[^a-zA-Z0-9-_]/g, "_")}${parseAttempt > 1 ? `__retry${parseAttempt}` : ""}.prompt.txt`);
-    fs.writeFileSync(promptPath, ["あなたは JSON のみを返す情報整理アシスタントです。", "前置き、説明、コードブロックは禁止です。", "コマンド実行、ファイル変更、ツール使用は禁止です。", "必ず単一の JSON オブジェクトだけを返してください。", "", prompt].join("\n"), "utf8");
-    if (runtime.config.provider === "ollama") {
-      logTextBlock("system", `${taskKey}__${itemId}${parseAttempt > 1 ? ` retry=${parseAttempt}` : ""}`, getOllamaSystemPrompt(runtime.config));
-    }
-    logTextBlock("prompt", `${taskKey}__${itemId}${parseAttempt > 1 ? ` retry=${parseAttempt}` : ""}`, prompt);
-    const aiResult = await runAiWithRetry(runtime, taskKey, itemId, async () => client.runJsonTurn({
-      model: meta.model,
-      think: meta.think,
-      cwd: process.cwd(),
-      prompt,
-      onProgress: (event) => {
-        runtime.current.sentAt = event.sentAt || runtime.current.sentAt;
-        runtime.current.promptStats = event.promptStats || runtime.current.promptStats;
-        if (event.phase === "thinking" && event.thinkingText) {
-          logThinkingConsole(taskKey, itemId, event.thinkingText);
-        }
-        if (event.phase === "agent-message" && event.deltaText) {
-          logResponseDeltaConsole(taskKey, itemId, event.deltaText);
-        }
-        if (event.phase === "turn-start") {
-          logTaskProgressConsole(runtime);
-        }
-        writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: event.promptPreview || runtime.current.promptPreview, promptStats: event.promptStats || runtime.current.promptStats, sentAt: event.sentAt || runtime.current.sentAt, note: event.note || null, lastEvent: `ai.${event.phase || "progress"}` });
-      }
-    })).catch((error) => {
-      throw normalizeAiFailure(error);
-    });
-    const text = typeof aiResult === "string" ? aiResult : String(aiResult?.text || "");
-    const usage = typeof aiResult === "string" ? null : normalizeAiUsage(aiResult?.usage);
-    flushResponseDeltaConsole(taskKey, itemId);
-    logTextBlock("response", `${taskKey}__${itemId}${parseAttempt > 1 ? ` retry=${parseAttempt}` : ""}`, text);
-    writeRaw(runtime, taskKey, itemId, text, usage);
-    const parsedResult = parseAiJsonResponse(text);
-    if (parsedResult.parsed) {
-      if (usage) {
-        emitEvent(runtime, { type: "task.ai_usage", stage: runtime.current.stage, taskKey, itemType: runtime.current.itemType, itemId, taskInstanceId: runtime.current.taskInstanceId, usage });
-      }
-      writeJson(cachePath, { schemaVersion: 1, cachedAt: isoJst(), taskKey, itemId, model: meta.model, think: meta.think, inputHash: meta.inputHash, promptHash: meta.promptHash, text, parsed: parsedResult.parsed, usage });
-      return { text, parsed: parsedResult.parsed, usage, cacheHit: false };
-    }
-    writeParseError(runtime, taskKey, itemId, {
-      parseAttempt,
-      model: meta.model,
-      think: meta.think,
-      promptHash: meta.promptHash,
-      inputHash: meta.inputHash,
-      usage,
-      ...parsedResult
-    });
-    emitEvent(runtime, { type: "task.json_parse_error", stage: runtime.current.stage, taskKey, itemType: runtime.current.itemType, itemId, taskInstanceId: runtime.current.taskInstanceId, note: `JSON 解析に失敗しました (attempt=${parseAttempt})` });
-    if (parseAttempt < maxParseAttempts) {
-      const note = `JSON 形式エラーのため、より厳しい JSON 指示で再実行します (${parseAttempt}/${maxParseAttempts})`;
-      emitEvent(runtime, { type: "task.retry_scheduled", stage: runtime.current.stage, taskKey, itemType: runtime.current.itemType, itemId, taskInstanceId: runtime.current.taskInstanceId, note });
-      logConsole("retry", runtime.current.taskInstanceId, note);
-      writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: runtime.current.promptPreview, sentAt: runtime.current.sentAt, note, lastEvent: "task.retry_scheduled" });
-      continue;
-    }
-    if (/prompt token count .* exceeds the limit/i.test(parsedResult.normalized || "")) {
-      throw new Error(`AI プロンプトが長すぎます: ${clip(parsedResult.normalized, 220)}`);
-    }
-    throw new Error(`AI が JSON ではない応答を返しました: ${clip(parsedResult.normalized || text, 220)}`);
-  }
-  throw new Error("AI の JSON 応答を取得できませんでした。");
-}
-
-async function runAiWithRetry(runtime, taskKey, itemId, run) {
-  const maxAttempts = 5;
-  let lastError = null;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      const result = await run();
-      const text = typeof result === "string" ? result : String(result?.text || "");
-      if (isRetryableAiText(text)) {
-        throw new Error(text.trim());
-      }
-      return result;
-    } catch (error) {
-      lastError = error;
-      if (!isRetryableAiFailure(error) || attempt === maxAttempts) {
-        throw error;
-      }
-      const delayMs = Math.min(1000 * (2 ** (attempt - 1)), 30000);
-      const diagnostics = await collectAiRetryDiagnostics(error);
-      const note = `一時的な AI エラーのため ${delayMs}ms 後に再試行します (${attempt}/${maxAttempts}) 理由=${summarizeAiRetryError(error)}${diagnostics ? ` ${diagnostics}` : ""}`;
-      emitEvent(runtime, { type: "task.retry_scheduled", stage: runtime.current.stage, taskKey, itemType: runtime.current.itemType, itemId, taskInstanceId: runtime.current.taskInstanceId, note });
-      logConsole("retry", runtime.current.taskInstanceId, note);
-      writeProgress(runtime, { status: "running", stage: runtime.current.stage, taskKey: runtime.current.taskKey, itemType: runtime.current.itemType, currentItemId: runtime.current.itemId, currentTaskInstanceId: runtime.current.taskInstanceId, promptPreview: runtime.current.promptPreview, sentAt: runtime.current.sentAt, note, lastEvent: "task.retry_scheduled" });
-      await sleep(delayMs);
-    }
-  }
-  throw lastError ?? new Error("AI 呼び出しに失敗しました");
-}
-
-function normalizeAiFailure(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  if (isQuotaExceededFailure(message)) {
-    return new Error(`AI 利用枠が不足しています: quota 切れのため処理を継続できません。${extractRequestId(message) ? ` (${extractRequestId(message)})` : ""}`);
-  }
-  return error instanceof Error ? error : new Error(message);
-}
-
-function isQuotaExceededFailure(message) {
-  return /\b402\b.*\bno quota\b/i.test(String(message || ""));
-}
-
-function extractRequestId(message) {
-  const match = String(message || "").match(/Request ID:\s*([^)]+)/i);
-  return match?.[1]?.trim() || null;
-}
-
-function isRetryableAiText(text) {
-  const normalized = String(text || "").trim();
-  return /^Error:/i.test(normalized) && /(429|rate limit|temporar|timeout|ECONNRESET|socket hang up|service unavailable|too many requests|invalid_request_body|fetch failed|internal error|-32603|同一行を繰り返したため中断しました)/i.test(normalized);
-}
-
-function isRetryableAiFailure(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return /(429|rate limit|temporar|timeout|ECONNRESET|socket hang up|service unavailable|too many requests|invalid_request_body|fetch failed|internal error|-32603|同一行を繰り返したため中断しました)/i.test(message);
-}
-
-function summarizeAiRetryError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  const normalized = String(message || "").replace(/\s+/g, " ").trim();
-  if (!normalized) {
-    return "詳細不明";
-  }
-  if (/Ollama 応答がタイムアウトしました|UND_ERR_HEADERS_TIMEOUT|Headers Timeout Error/i.test(normalized)) {
-    return clip(normalized, 220);
-  }
-  if (/Ollama への接続に失敗しました|fetch failed|ECONNREFUSED|ECONNRESET|socket hang up/i.test(normalized)) {
-    return clip(normalized, 220);
-  }
-  if (/同一行を繰り返したため中断しました/i.test(normalized)) {
-    return clip(normalized, 220);
-  }
-  if (/invalid_request_body|internal error|-32603|service unavailable|too many requests|rate limit|429/i.test(normalized)) {
-    return clip(normalized, 220);
-  }
-  return clip(normalized, 220);
-}
-
-async function collectAiRetryDiagnostics(error) {
-  if (!isOllamaTimeoutRetryError(error)) {
-    return "";
-  }
-  return formatOllamaCpuSnapshot(await sampleOllamaCpuUsage());
-}
-
-function isOllamaTimeoutRetryError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return /Ollama 応答がタイムアウトしました|UND_ERR_HEADERS_TIMEOUT|Headers Timeout Error|UND_ERR_BODY_TIMEOUT|Body Timeout Error/i.test(message);
-}
-
-async function sampleOllamaCpuUsage() {
-  const script = [
-    "$ErrorActionPreference = 'SilentlyContinue'",
-    "$cores = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors",
-    "$p1 = Get-Process -Name ollama -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, CPU",
-    "Start-Sleep -Milliseconds 1000",
-    "$p2 = Get-Process -Name ollama -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, CPU, WorkingSet64",
-    "$result = @()",
-    "foreach ($b in $p2) {",
-    "  $a = $p1 | Where-Object { $_.Id -eq $b.Id } | Select-Object -First 1",
-    "  $delta = $null",
-    "  if ($a -and $null -ne $a.CPU -and $null -ne $b.CPU) { $delta = $b.CPU - $a.CPU }",
-    "  $cpu = $null",
-    "  if ($null -ne $delta -and $cores) { $cpu = [math]::Round(($delta / 1.0 / $cores) * 100, 1) }",
-    "  $mem = $null",
-    "  if ($null -ne $b.WorkingSet64) { $mem = [math]::Round($b.WorkingSet64 / 1MB, 1) }",
-    "  $result += [pscustomobject]@{ pid = $b.Id; name = $b.ProcessName; cpuPercent = $cpu; workingSetMB = $mem }",
-    "}",
-    "$result | ConvertTo-Json -Compress"
-  ].join("; ");
-  try {
-    const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], { windowsHide: true, timeout: 5000, maxBuffer: 1024 * 1024 });
-    const text = String(stdout || "").trim();
-    if (!text) {
-      return [];
-    }
-    const parsed = JSON.parse(text);
-    return Array.isArray(parsed) ? parsed : [parsed];
-  } catch {
-    return null;
-  }
-}
-
-function formatOllamaCpuSnapshot(snapshot) {
-  if (snapshot === null) {
-    return "ollamaCpu=取得失敗";
-  }
-  if (!Array.isArray(snapshot) || snapshot.length === 0) {
-    return "ollamaCpu=processなし";
-  }
-  const details = snapshot
-    .map((process) => {
-      const pid = process?.pid ?? "-";
-      const cpu = Number.isFinite(Number(process?.cpuPercent)) ? `${Number(process.cpuPercent).toFixed(1)}%` : "-";
-      const mem = Number.isFinite(Number(process?.workingSetMB)) ? `${Number(process.workingSetMB).toFixed(1)}MB` : "-";
-      return `pid=${pid} cpu=${cpu} mem=${mem}`;
-    })
-    .join("; ");
-  return `ollamaCpu=${details}`;
-}
-
-function isContextOverflowFailure(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return /(prompt token count .* exceeds the limit|maximum context length|context length|too many tokens|token limit|input too long|request too large|exceeds the limit|AI プロンプトが長すぎます)/i.test(message);
-}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function buildJsonRepairPrompt(prompt) {
-  return [
-    prompt,
-    "",
-    "追加の厳格ルール:",
-    "- 必ず JSON 構文として正しい単一の JSON オブジェクトだけを返してください。",
-    "- 説明文、Markdown、コードブロック、前置きは返さないでください。",
-    "- キーは重複させないでください。",
-    "- 配列やオブジェクトを途中で切らないでください。",
-    "- 文字列値の中に生の改行を入れないでください。",
-    "- スキーマは上の指示に厳密に従ってください。"
-  ].join("\n");
-}
 
-function recoverJsonObjectText(text) {
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start < 0 || end <= start) {
-    return null;
-  }
-  return text.slice(start, end + 1).trim();
-}
-
-function recoverLastJsonFence(text) {
-  const matches = [...String(text || "").matchAll(/```json\s*([\s\S]*?)\s*```/gi)];
-  if (!matches.length) {
-    return null;
-  }
-  const last = matches[matches.length - 1]?.[1]?.trim();
-  return last || null;
-}
-
-function parseAiJsonResponse(text) {
-  const normalized = stripFence(String(text || "").trim());
-  if (/^Error:/i.test(normalized)) {
-    throw normalizeAiFailure(new Error(normalized));
-  }
-  try {
-    return { parsed: JSON.parse(normalized), normalized, fenced: null, recovered: null, repaired: null };
-  } catch {}
-  const fenced = recoverLastJsonFence(normalized);
-  if (fenced) {
-    try {
-      return { parsed: JSON.parse(fenced), normalized, fenced, recovered: null, repaired: null };
-    } catch {}
-  }
-  const recovered = recoverJsonObjectText(normalized);
-  if (recovered) {
-    try {
-      return { parsed: JSON.parse(recovered), normalized, fenced, recovered, repaired: null };
-    } catch {}
-  }
-  const repaired = repairJsonText(recovered || normalized);
-  if (repaired) {
-    try {
-      return { parsed: JSON.parse(repaired), normalized, fenced, recovered, repaired };
-    } catch {}
-  }
-  return { parsed: null, normalized, fenced, recovered, repaired };
-}
-
-function repairJsonText(text) {
-  if (!text) {
-    return null;
-  }
-  text = String(text)
-    .replaceAll("“", "\"")
-    .replaceAll("”", "\"")
-    .replaceAll("„", "\"")
-    .replaceAll("‟", "\"")
-    .replaceAll("「", "\"")
-    .replaceAll("」", "\"")
-    .replaceAll("’", "'")
-    .replaceAll("‘", "'");
-  text = text.replace(/\\\\",\\n\s+\\"(userIntent|assistantResponse|outcome)\\":/g, (_match, key) => `",\n  "${key}":`);
-  text = text.replace(/\]\s*,\s*\[/g, ",");
-  text = repairMalformedKeywordsField(text);
-  let result = "";
-  let inString = false;
-  let escaped = false;
-
-  for (let index = 0; index < text.length; index += 1) {
-    const char = text[index];
-    if (inString) {
-      if (!escaped) {
-        if (char === "\r") {
-          continue;
-        }
-        if (char === "\n") {
-          result += "\\n";
-          continue;
-        }
-        if (char === "\t") {
-          result += "\\t";
-          continue;
-        }
-        if (char === "\b") {
-          result += "\\b";
-          continue;
-        }
-        if (char === "\f") {
-          result += "\\f";
-          continue;
-        }
-        if (isIllegalJsonControlChar(char)) {
-          continue;
-        }
-        if (char === "\"") {
-          if (isLikelyStringTerminator(text, index)) {
-            result += char;
-            inString = false;
-            continue;
-          }
-          result += "\\\"";
-          continue;
-        }
-      }
-      result += char;
-      if (escaped) {
-        escaped = false;
-        continue;
-      }
-      if (char === "\\") {
-        escaped = true;
-        continue;
-      }
-      continue;
-    }
-
-    if (char === "\"") {
-      inString = true;
-      result += char;
-      continue;
-    }
-    if (isIllegalJsonControlChar(char)) {
-      continue;
-    }
-    if (char === "(" || char === ")") {
-      continue;
-    }
-    result += char;
-  }
-
-  return result.trim() || null;
-}
-
-function isLikelyStringTerminator(text, index) {
-  for (let cursor = index + 1; cursor < text.length; cursor += 1) {
-    const char = text[cursor];
-    if (char === " " || char === "\t" || char === "\r" || char === "\n") {
-      continue;
-    }
-    return char === ":" || char === "," || char === "}" || char === "]";
-  }
-  return true;
-}
-
-function isIllegalJsonControlChar(char) {
-  const code = String(char || "").charCodeAt(0);
-  return Number.isFinite(code) && code >= 0x00 && code <= 0x1f && char !== "\r" && char !== "\n" && char !== "\t" && char !== "\b" && char !== "\f";
-}
-
-function repairMalformedKeywordsField(text) {
-  let repaired = String(text);
-  repaired = repaired.replace(/"keywords"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"/g, (_match, a, b, c, d) => `"keywords":["${a}","${b}","${c}","${d}"]`);
-  repaired = repaired.replace(/"keywords"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"/g, (_match, a, b, c) => `"keywords":["${a}","${b}","${c}"]`);
-  repaired = repaired.replace(/"keywords"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"/g, (_match, a, b) => `"keywords":["${a}","${b}"]`);
-  return repaired;
-}
-
-function stripFence(text) { return text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, ""); }
 function uniqueStrings(values) { return [...new Set((values || []).map((value) => String(value).trim()).filter(Boolean))]; }
 function dedupeObjects(values, keyFn) { const seen = new Set(); const items = []; for (const value of values || []) { const key = keyFn(value); if (seen.has(key)) continue; seen.add(key); items.push(value); } return items; }
 function normalizeQuestionKey(text) { return String(text || "").trim().toLowerCase(); }
@@ -3144,19 +2033,8 @@ function normalizeQuestionStatus(status) { return ["resolved", "partially_resolv
 function compareQuestionStatus(left, right) { const rank = { unresolved: 0, partially_resolved: 1, resolved: 2 }; return (rank[normalizeQuestionStatus(left)] || 0) - (rank[normalizeQuestionStatus(right)] || 0); }
 function readArtifact(runtime, relativePath) { return readJson(path.join(runtime.paths.root, relativePath)); }
 function writeArtifact(runtime, relativePath, value) { writeJson(path.join(runtime.paths.root, relativePath), value); }
-function writeRaw(runtime, taskKey, itemId, text, usage = null) {
-  const normalizedUsage = normalizeAiUsage(usage);
-  writeArtifact(runtime, `artifacts/raw/${taskKey}/${itemId}.raw.json`, {
-    schemaVersion: 1,
-    generatedAt: isoJst(),
-    runId: runtime.config.runId,
-    taskKey,
-    itemId,
-    rawText: text,
-    ...(normalizedUsage ? { usage: normalizedUsage } : {})
-  });
-}
-function writeParseError(runtime, taskKey, itemId, value) { writeArtifact(runtime, `artifacts/raw/${taskKey}/${itemId}.parse-error.json`, { schemaVersion: 1, generatedAt: isoJst(), runId: runtime.config.runId, taskKey, itemId, ...value }); }
+
+
 function readUnit(runtime, itemId) { const item = (readArtifact(runtime, "artifacts/units/units.json")?.items || []).find((candidate) => candidate.itemId === itemId); if (!item) throw new Error(`unit が見つかりません: ${itemId}`); return item; }
 function readEntry(runtime, itemId) { const units = (readArtifact(runtime, "artifacts/units/units.json")?.items || []).filter((unit) => unit.entryId === itemId); if (!units.length) throw new Error(`entry が見つかりません: ${itemId}`); return { itemId, date: units[0].date || itemId.replace(/^entry_/, ""), units, unitSummaries: units.map((unit) => readArtifact(runtime, `artifacts/ai/unit_summaries/${unit.itemId}.json`)).filter(Boolean) }; }
 function readThread(runtime, itemId) { const item = readArtifact(runtime, `artifacts/normalized/${itemId}.json`); if (!item) throw new Error(`thread が見つかりません: ${itemId}`); return item; }
@@ -3324,612 +2202,160 @@ function getChangedEntryIds(runtime) {
   }
   return changed;
 }
-function draftToMarkdown(draft) { return [draft.lead || "", ...(draft.sections || []).flatMap((section) => [section.heading ? `### ${section.heading}` : "", section.body || "", ""]), draft.closing || ""].filter(Boolean).join("\n\n"); }
-function renderPostSlug(entry) { return sanitizeId(entry.date || entry.itemId || "entry"); }
-function buildEntryMarkdown(runtime, post, entry, navigation = {}) {
-  const navLinks = [
-      navigation.previousPost ? `[前の日: ${navigation.previousPost.date || navigation.previousPost.title}](./${path.posix.basename(navigation.previousPost.htmlPath)})` : null,
-      `[一覧へ](../index.html)`,
-      navigation.nextPost ? `[次の日: ${navigation.nextPost.date || navigation.nextPost.title}](./${path.posix.basename(navigation.nextPost.htmlPath)})` : null
-    ].filter(Boolean);
-    const imageBlocks = buildEntryImageMarkdown(runtime, post, entry);
-    return [
-      `# ${entry.title || entry.itemId}`,
-      "",
-      entry.date ? `- 日付: ${entry.date}` : null,
-      entry.itemId ? `- entryId: ${entry.itemId}` : null,
-      "",
-      navLinks.length ? navLinks.join(" | ") : null,
-      navLinks.length ? "" : null,
-      entry.markdownBody || "",
-      imageBlocks.length ? "" : null,
-      imageBlocks.length ? "## 生成画像" : null,
-      imageBlocks.length ? "" : null,
-      ...imageBlocks,
-      post.threads?.length ? "" : null,
-      post.threads?.length ? "## 関連スレッド" : null,
-      post.threads?.length ? "" : null,
-      ...(post.threads || []).map((thread) => `- ${thread.itemId}: ${thread.title}${thread.categoryLabel ? ` [${thread.categoryLabel}]` : ""}${thread.chatgptUrl ? ` ([ChatGPTで開く](${thread.chatgptUrl}))` : ""}`)
-    ].filter(Boolean).join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
-  }
-function writeRenderPostsMarkdown(runtime, entries) {
-  const postsDir = path.join(runtime.paths.root, "artifacts", "render", "posts");
-  ensureDir(postsDir);
-  const categoryMap = new Map((readCategoryMaster(runtime)?.categories || []).map((category) => [category.id, category.label]));
-  const units = readArtifact(runtime, "artifacts/units/units.json")?.items || [];
-  const changedEntryIds = getChangedEntryIds(runtime);
-  const existingPosts = new Map(((readArtifact(runtime, "artifacts/render/posts.json")?.posts) || []).map((post) => [post.entryId, post]));
-  const posts = entries.map((entry) => {
-    const slug = renderPostSlug(entry);
-      const markdownPath = `artifacts/render/posts/${slug}.md`;
-      const htmlPath = `artifacts/render/posts/${slug}.html`;
-      const threadItemIds = units.filter((unit) => unit.entryId === entry.itemId).flatMap((unit) => unit.threadItemIds || []);
-      const categories = buildRenderPostCategories(runtime, threadItemIds, categoryMap);
-      const threads = buildRenderPostThreads(runtime, threadItemIds, categoryMap);
-      const existing = existingPosts.get(entry.itemId);
-      return existing && !changedEntryIds.has(entry.itemId)
-        ? { ...existing, slug, date: entry.date || null, title: entry.title || entry.itemId, markdownPath, htmlPath, categories, threads }
-        : { slug, entryId: entry.itemId, date: entry.date || null, title: entry.title || entry.itemId, markdownPath, htmlPath, categories, threads };
-    });
-  posts.forEach((post, index) => {
-    const entry = entries[index];
-    const previousPost = index > 0 ? posts[index - 1] : null;
-    const nextPost = index < posts.length - 1 ? posts[index + 1] : null;
-    if (!existingPosts.has(post.entryId) || changedEntryIds.has(post.entryId)) {
-        fs.writeFileSync(path.join(runtime.paths.root, post.markdownPath), buildEntryMarkdown(runtime, post, entry, { previousPost, nextPost }), "utf8");
-      }
-    });
-    return posts;
-  }
-function threadItemIdsForEntry(runtime, entryId) {
-  return (readArtifact(runtime, "artifacts/units/units.json")?.items || [])
-    .filter((unit) => unit.entryId === entryId)
-    .flatMap((unit) => unit.threadItemIds || []);
-}
-function buildArchiveStatsFromEntries(runtime, entries, options = {}) {
-  const categoryMap = new Map((readCategoryMaster(runtime)?.categories || []).map((category) => [category.id, category.label]));
-  const posts = (entries || []).map((entry) => {
-    const threadItemIds = threadItemIdsForEntry(runtime, entry.itemId);
-    return {
-      entryId: entry.itemId,
-      date: entry.date || null,
-      categories: buildRenderPostCategories(runtime, threadItemIds, categoryMap),
-      threads: buildRenderPostThreads(runtime, threadItemIds, categoryMap)
-    };
-  });
-  return buildArchiveStats(runtime, posts, options);
-}
-function buildArchiveStats(runtime, posts, options = {}) {
-  const threadIndex = new Map((readArtifact(runtime, "artifacts/indexes/thread-index.json")?.threads || []).map((thread) => [thread.itemId, thread]));
-  const uniqueThreads = new Map();
-  const categoryCounts = new Map();
-  const primaryCategoryCounts = new Map();
-  const days = new Set();
-  for (const post of posts || []) {
-    if (post.date) {
-      days.add(post.date);
-    }
-    for (const category of post.categories || []) {
-      incrementCategoryCount(categoryCounts, category);
-    }
-    for (const thread of post.threads || []) {
-      if (!thread?.itemId || uniqueThreads.has(thread.itemId)) {
-        continue;
-      }
-      const indexed = threadIndex.get(thread.itemId) || {};
-      uniqueThreads.set(thread.itemId, { ...indexed, ...thread });
-      if (thread.categoryId) {
-        incrementCategoryCount(primaryCategoryCounts, { id: thread.categoryId, label: thread.categoryLabel || thread.categoryId });
-      }
-    }
-  }
-  const threadValues = [...uniqueThreads.values()];
-  const tokenEstimate = estimateArchiveConversationTokens(runtime, threadValues);
-  return {
-    dayCount: days.size || (posts || []).length,
-    weekCount: Number(options.weekCount || 0),
-    monthCount: Number(options.monthCount || 0),
-    threadCount: threadValues.length,
-    messageCount: sumThreadMetric(threadValues, "messageCount"),
-    userMessageCount: sumThreadMetric(threadValues, "userMessageCount"),
-    assistantMessageCount: sumThreadMetric(threadValues, "assistantMessageCount"),
-    estimatedInputTokens: tokenEstimate.inputTokens,
-    estimatedOutputTokens: tokenEstimate.outputTokens,
-    estimatedTotalTokens: tokenEstimate.inputTokens + tokenEstimate.outputTokens,
-    generatedImageCount: sumThreadMetric(threadValues, "generatedImageCount"),
-    topCategories: sortCategoryCounts(categoryCounts),
-    topPrimaryCategories: sortCategoryCounts(primaryCategoryCounts)
-  };
-}
-function estimateArchiveConversationTokens(runtime, threads) {
-  let inputTokens = 0;
-  let outputTokens = 0;
-  for (const thread of threads || []) {
-    const normalized = readArtifact(runtime, `artifacts/normalized/${thread.itemId}.json`) || {};
-    for (const message of normalized.messages || []) {
-      const tokens = estimateInputTokens(message?.text || "");
-      if (message?.role === "user") {
-        inputTokens += tokens;
-      } else if (message?.role === "assistant") {
-        outputTokens += tokens;
-      }
-    }
-  }
-  return { inputTokens, outputTokens };
-}
-function incrementCategoryCount(map, category) {
-  const id = category?.id || category?.categoryId || "uncategorized";
-  const label = category?.label || category?.categoryLabel || id;
-  if (!map.has(id)) {
-    map.set(id, { id, label, count: 0 });
-  }
-  map.get(id).count += 1;
-}
-function sortCategoryCounts(map) {
-  return [...map.values()].sort((left, right) => right.count - left.count || left.label.localeCompare(right.label, "ja"));
-}
-function sumThreadMetric(threads, key) {
-  return (threads || []).reduce((sum, thread) => sum + Number(thread?.[key] || 0), 0);
-}
-function writeRenderArchivesMarkdown(runtime, posts) {
-  const weeksDir = path.join(runtime.paths.root, "artifacts", "render", "weeks");
-  const monthsDir = path.join(runtime.paths.root, "artifacts", "render", "months");
-  const yearsDir = path.join(runtime.paths.root, "artifacts", "render", "years");
-  ensureDir(weeksDir);
-  ensureDir(monthsDir);
-  ensureDir(yearsDir);
-  const weeks = buildRenderWeeks(runtime, posts);
-  const months = buildRenderMonths(runtime, weeks);
-  const years = buildRenderYears(runtime, months);
-  for (const week of weeks) {
-    fs.writeFileSync(path.join(runtime.paths.root, week.markdownPath), buildRenderWeekMarkdown(week), "utf8");
-  }
-  for (const month of months) {
-    fs.writeFileSync(path.join(runtime.paths.root, month.markdownPath), buildRenderMonthMarkdown(month), "utf8");
-  }
-  for (const year of years) {
-    fs.writeFileSync(path.join(runtime.paths.root, year.markdownPath), buildRenderYearMarkdown(year), "utf8");
-  }
-  return { weeks, months, years };
-}
-function buildRenderWeeks(runtime, posts) {
-  const buckets = new Map();
-  for (const post of posts || []) {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(post.date || ""))) {
-      continue;
-    }
-    const weekId = monthWeekKey(post.date);
-    if (!weekId) {
-      continue;
-    }
-    if (!buckets.has(weekId)) {
-      buckets.set(weekId, { itemId: `week_${weekId}`, week: weekId, month: weekId.slice(0, 7), title: `${weekId} の日記`, markdownPath: `artifacts/render/weeks/${weekId}.md`, htmlPath: `artifacts/render/weeks/${weekId}.html`, posts: [] });
-    }
-    buckets.get(weekId).posts.push(post);
-  }
-  return [...buckets.values()]
-    .map((week) => {
-      const sortedPosts = week.posts.sort((a, b) => (a.date || "").localeCompare(b.date || "", "ja"));
-      return { ...week, summary: readArtifact(runtime, `artifacts/ai/weekly_summaries/${week.itemId}.json`) || null, stats: buildArchiveStats(runtime, sortedPosts, { weekCount: 1 }), posts: sortedPosts };
-    })
-    .sort((a, b) => a.week.localeCompare(b.week, "ja"));
-}
-function buildRenderMonths(runtime, weeks) {
-  const buckets = new Map();
-  for (const week of weeks || []) {
-    const monthId = week.month || week.week.slice(0, 7);
-    if (!buckets.has(monthId)) {
-      buckets.set(monthId, { itemId: `month_${monthId}`, month: monthId, title: `${monthId} の日記`, markdownPath: `artifacts/render/months/${monthId}.md`, htmlPath: `artifacts/render/months/${monthId}.html`, weeks: [], posts: [] });
-    }
-    buckets.get(monthId).weeks.push(week);
-    buckets.get(monthId).posts.push(...(week.posts || []));
-  }
-  return [...buckets.values()]
-    .map((month) => {
-      const sortedWeeks = month.weeks.sort((a, b) => a.week.localeCompare(b.week, "ja"));
-      const sortedPosts = month.posts.sort((a, b) => (a.date || "").localeCompare(b.date || "", "ja"));
-      return { ...month, summary: readArtifact(runtime, `artifacts/ai/monthly_summaries/${month.itemId}.json`) || null, stats: buildArchiveStats(runtime, sortedPosts, { monthCount: 1, weekCount: sortedWeeks.length }), weeks: sortedWeeks, posts: sortedPosts };
-    })
-    .sort((a, b) => a.month.localeCompare(b.month, "ja"));
-}
-function buildRenderYears(runtime, months) {
-  const buckets = new Map();
-  for (const month of months || []) {
-    const yearId = month.month.slice(0, 4);
-    if (!buckets.has(yearId)) {
-      buckets.set(yearId, { itemId: `year_${yearId}`, year: yearId, title: `${yearId} 年の日記`, markdownPath: `artifacts/render/years/${yearId}.md`, htmlPath: `artifacts/render/years/${yearId}.html`, months: [], postCount: 0 });
-    }
-    buckets.get(yearId).months.push(month);
-    buckets.get(yearId).postCount += month.posts.length;
-  }
-  return [...buckets.values()]
-    .map((year) => {
-      const sortedMonths = year.months.sort((a, b) => a.month.localeCompare(b.month, "ja"));
-      return { ...year, summary: readArtifact(runtime, `artifacts/ai/yearly_summaries/${year.itemId}.json`) || null, stats: buildArchiveStats(runtime, sortedMonths.flatMap((month) => month.posts || []), { weekCount: sortedMonths.reduce((sum, month) => sum + (month.weeks?.length || 0), 0), monthCount: sortedMonths.length }), months: sortedMonths };
-    })
-    .sort((a, b) => a.year.localeCompare(b.year, "ja"));
-}
-function buildRenderWeekMarkdown(week) {
-  const summary = week.summary ? buildWeeklySummaryMarkdown(week.summary) : "";
-  const stats = buildArchiveStatsMarkdown(week.stats);
-  return [
-    `# ${week.summary?.title || week.title}`,
-    "",
-    `- 週: ${week.week}`,
-    `- 日数: ${week.posts.length}`,
-    "",
-    stats,
-    stats ? "" : null,
-    summary,
-    summary ? "" : null,
-    "## 日別",
-    "",
-    ...week.posts.map((post) => `- [${post.date || "unknown"} | ${post.title}](../posts/${path.posix.basename(post.htmlPath)})`)
-  ].filter((line) => line !== null).join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
-}
-function buildRenderMonthMarkdown(month) {
-  const summary = month.summary ? buildMonthlySummaryMarkdown(month.summary) : "";
-  const stats = buildArchiveStatsMarkdown(month.stats);
-  return [
-    `# ${month.summary?.title || month.title}`,
-    "",
-    `- 日数: ${month.posts.length}`,
-    "",
-    stats,
-    stats ? "" : null,
-    summary,
-    summary ? "" : null,
-    "## 週別",
-    "",
-    ...month.weeks.map((week) => `- [${week.week} (${week.posts.length}日)](../weeks/${path.posix.basename(week.htmlPath)})`)
-  ].filter((line) => line !== null).join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
-}
-function buildRenderYearMarkdown(year) {
-  const summary = year.summary ? buildYearlySummaryMarkdown(year.summary) : "";
-  const stats = buildArchiveStatsMarkdown(year.stats);
-  return [
-    `# ${year.summary?.title || year.title}`,
-    "",
-    `- 月数: ${year.months.length}`,
-    `- 日数: ${year.postCount}`,
-    "",
-    stats,
-    stats ? "" : null,
-    summary,
-    summary ? "" : null,
-    ...year.months.map((month) => `- [${month.month} (${month.posts.length}日)](../months/${path.posix.basename(month.htmlPath)})`)
-  ].filter((line) => line !== null).join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
-}
-function buildArchiveStatsMarkdown(stats) {
-  if (!stats) {
-    return "";
-  }
-  return [
-    "## 統計",
-    "",
-    `- 日数: ${stats.dayCount}`,
-    stats.weekCount ? `- 週数: ${stats.weekCount}` : null,
-    stats.monthCount ? `- 月数: ${stats.monthCount}` : null,
-    `- スレッド数: ${stats.threadCount}`,
-    `- メッセージ数: ${stats.messageCount}`,
-    `- ユーザー発話数: ${stats.userMessageCount}`,
-    `- アシスタント発話数: ${stats.assistantMessageCount}`,
-    `- 推定入力トークン数: ${formatInteger(stats.estimatedInputTokens)}`,
-    `- 推定出力トークン数: ${formatInteger(stats.estimatedOutputTokens)}`,
-    `- 推定合計トークン数: ${formatInteger(stats.estimatedTotalTokens)}`,
-    `- 生成画像数: ${stats.generatedImageCount}`,
-    stats.topCategories?.length ? `- 多かった話題: ${stats.topCategories.slice(0, 8).map((category) => `${category.label} (${category.count})`).join("、")}` : null,
-    stats.topPrimaryCategories?.length ? `- 主話題: ${stats.topPrimaryCategories.slice(0, 8).map((category) => `${category.label} (${category.count})`).join("、")}` : null
-  ].filter(Boolean).join("\n");
-}
-function buildWeeklySummaryMarkdown(summary) {
-  return [
-    summary.overview || "",
-    ...(summary.themes || []).flatMap((theme) => [theme.heading ? `## ${theme.heading}` : "", theme.body || "", ""]),
-    summary.notableDays?.length ? "## 印象に残った日" : "",
-    ...(summary.notableDays || []).map((day) => `- ${day.date || "unknown"}: ${day.title || ""}${day.note ? ` - ${day.note}` : ""}`),
-    summary.closing ? "" : null,
-    summary.closing || ""
-  ].filter(Boolean).join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
-}
-function buildMonthlySummaryMarkdown(summary) {
-  return [
-    summary.overview || "",
-    ...(summary.themes || []).flatMap((theme) => [theme.heading ? `## ${theme.heading}` : "", theme.body || "", ""]),
-    summary.notableWeeks?.length ? "## 印象に残った週" : "",
-    ...(summary.notableWeeks || []).map((week) => `- ${week.week || "unknown"}: ${week.title || ""}${week.note ? ` - ${week.note}` : ""}`),
-    summary.closing ? "" : null,
-    summary.closing || ""
-  ].filter(Boolean).join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
-}
-function buildYearlySummaryMarkdown(summary) {
-  return [
-    summary.overview || "",
-    ...(summary.themes || []).flatMap((theme) => [theme.heading ? `## ${theme.heading}` : "", theme.body || "", ""]),
-    summary.notableMonths?.length ? "## 印象に残った月" : "",
-    ...(summary.notableMonths || []).map((month) => `- ${month.month || "unknown"}: ${month.title || ""}${month.note ? ` - ${month.note}` : ""}`),
-    summary.closing ? "" : null,
-    summary.closing || ""
-  ].filter(Boolean).join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
-}
-function buildRenderIndexMarkdown(posts, weeks = [], months = [], years = []) {
-  return [
-    "# Nikki Blog",
-    "",
-    `- 生成日時: ${isoJst()}`,
-    "",
-    "## 年別",
-    "",
-    ...years.map((year) => `- [${year.year} (${year.postCount}日)](./years/${path.posix.basename(year.htmlPath)})`),
-    "",
-    "## 月別",
-    "",
-    ...months.map((month) => `- [${month.month} (${month.posts.length}日)](./months/${path.posix.basename(month.htmlPath)})`),
-    "",
-    "## 週別",
-    "",
-    ...weeks.map((week) => `- [${week.week} (${week.posts.length}日)](./weeks/${path.posix.basename(week.htmlPath)})`),
-    "",
-    "## 日別",
-    "",
-    ...posts.map((post) => `- [${post.date || "unknown"} | ${post.title}](./posts/${path.posix.basename(post.htmlPath)})`)
-  ].join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
-}
-  function buildRenderPostCategories(runtime, threadItemIds, categoryMap) {
-  const categories = [];
-  const seen = new Set();
-  for (const threadItemId of threadItemIds || []) {
-    const classification = readArtifact(runtime, `artifacts/ai/thread_classification/${threadItemId}.json`);
-    const ids = [classification?.primaryCategory || classification?.primary, ...((classification?.secondaryCategories || classification?.secondary || []))].filter(Boolean);
-    for (const id of ids) {
-      if (seen.has(id)) continue;
-      seen.add(id);
-      categories.push({ id, label: categoryMap.get(id) || id });
-    }
-    }
-    return categories;
-  }
-  function buildRenderPostThreads(runtime, threadItemIds, categoryMap) {
-      return (threadItemIds || []).map((threadItemId) => {
-        const thread = readArtifact(runtime, `artifacts/normalized/${threadItemId}.json`) || {};
-        const classification = readArtifact(runtime, `artifacts/ai/thread_classification/${threadItemId}.json`) || {};
-        const categoryId = classification.primaryCategory || classification.primary || null;
-        return {
-          itemId: threadItemId,
-          title: thread.title || thread.preview || threadItemId,
-          primaryDate: thread.primaryDate || null,
-          sourceThreadId: thread.sourceThreadId || null,
-          chatgptUrl: thread.sourceThreadId ? `https://chatgpt.com/c/${thread.sourceThreadId}` : null,
-          categoryId,
-          categoryLabel: categoryId ? (categoryMap.get(categoryId) || categoryId) : null
-        };
-      });
-    }
-  function buildEntryImageMarkdown(runtime, post, entry) {
-    const images = normalizeEntryImages(entry);
-    if (!images.length) {
-      return [];
-    }
-    return images.flatMap((image) => {
-      const relativePath = toPostRelativePath(runtime, post, image.path);
-      if (!relativePath) {
-        return [`- ${image.caption || "画像"}: ${image.path}`];
-      }
-      return [
-        image.caption ? `### ${image.caption}` : "### 画像",
-        "",
-        `![${image.caption || "generated image"}](${relativePath})`,
-        ""
-      ];
-    });
-  }
-  function normalizeEntryImages(entry) {
-    return (Array.isArray(entry?.images) ? entry.images : [])
-      .filter((image) => image?.path && fs.existsSync(image.path))
-      .map((image) => ({ path: image.path, caption: image.caption || image.note || "" }));
-  }
-  function toPostRelativePath(runtime, post, targetPath) {
-    if (!targetPath) {
-      return null;
-    }
-    const fromDir = path.join(runtime.paths.root, path.dirname(post.markdownPath || post.htmlPath));
-    return path.relative(fromDir, targetPath).replaceAll("\\", "/");
-  }
-  function escapeHtml(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll("\"", "&quot;")
-    .replaceAll("'", "&#39;");
-}
-function archiveHrefFromContext(relativePath, currentKind) {
-  if (currentKind === "post" || currentKind === "week" || currentKind === "month" || currentKind === "year") {
-    return `../${relativePath}`;
-  }
-  return `./${relativePath}`;
-}
-function buildBlogSidebarHtml(posts, currentSlug = null, weeks = [], months = [], years = [], currentKind = "index") {
-  return [
-    `<aside class="blog-sidebar">`,
-    `<div class="blog-sidebar-panel">`,
-    `<h1>Nikki Blog</h1>`,
-    `<p class="blog-sidebar-meta">生成日時: ${escapeHtml(isoJst())}</p>`,
-    years.length ? `<nav class="blog-archive-nav"><h2>年別</h2><ul>` : "",
-    ...years.map((year) => `<li><a href="${escapeHtml(archiveHrefFromContext(year.htmlPath.replace(/^artifacts\/render\//, ""), currentKind))}"><span class="blog-post-date">${escapeHtml(year.year)}</span><span class="blog-post-title">${year.postCount}日</span></a></li>`),
-    years.length ? `</ul></nav>` : "",
-    months.length ? `<nav class="blog-archive-nav"><h2>月別</h2><ul>` : "",
-    ...months.map((month) => `<li><a href="${escapeHtml(archiveHrefFromContext(month.htmlPath.replace(/^artifacts\/render\//, ""), currentKind))}"><span class="blog-post-date">${escapeHtml(month.month)}</span><span class="blog-post-title">${month.posts.length}日</span></a></li>`),
-    months.length ? `</ul></nav>` : "",
-    weeks.length ? `<nav class="blog-archive-nav"><h2>週別</h2><ul>` : "",
-    ...weeks.map((week) => `<li><a href="${escapeHtml(archiveHrefFromContext(week.htmlPath.replace(/^artifacts\/render\//, ""), currentKind))}"><span class="blog-post-date">${escapeHtml(week.week)}</span><span class="blog-post-title">${week.posts.length}日</span></a></li>`),
-    weeks.length ? `</ul></nav>` : "",
-    `<nav class="blog-sidebar-nav"><ul>`,
-    ...posts.map((post) => {
-      const isCurrent = currentSlug && post.slug === currentSlug;
-      const href = currentKind === "post" ? `${path.posix.basename(post.htmlPath)}` : archiveHrefFromContext(`posts/${path.posix.basename(post.htmlPath)}`, currentKind);
-      return `<li class="${isCurrent ? "is-current" : ""}"><a href="${href}"><span class="blog-post-date">${escapeHtml(post.date || "unknown")}</span><span class="blog-post-title">${escapeHtml(post.title)}</span></a></li>`;
-    }),
-    `</ul></nav>`,
-    `</div>`,
-    `</aside>`
-  ].join("");
-}
-function buildBlogCategorySidebarHtml(posts, currentPost = null) {
-  const aggregate = new Map();
-  for (const post of posts) {
-    for (const category of post.categories || []) {
-      if (!aggregate.has(category.id)) {
-        aggregate.set(category.id, { ...category, count: 0 });
-      }
-      aggregate.get(category.id).count += 1;
-    }
-  }
-  const currentIds = new Set((currentPost?.categories || []).map((category) => category.id));
-  const items = [...aggregate.values()].sort((left, right) => right.count - left.count || left.label.localeCompare(right.label, "ja"));
-  return [
-    `<aside class="blog-taxonomy">`,
-    `<div class="blog-taxonomy-panel">`,
-    `<h2>カテゴリ</h2>`,
-    `<ul class="blog-taxonomy-list">`,
-    ...items.map((category) => `<li class="${currentIds.has(category.id) ? "is-current" : ""}"><span class="blog-taxonomy-label">${escapeHtml(category.label)}</span><span class="blog-taxonomy-count">${category.count}</span></li>`),
-    `</ul>`,
-    `</div>`,
-    `</aside>`
-  ].join("");
-}
-function buildBlogNavHtml(previousPost, nextPost) {
-  const links = [
-    previousPost ? `<a href="./${path.posix.basename(previousPost.htmlPath)}">前の日: ${escapeHtml(previousPost.date || previousPost.title)}</a>` : `<span class="is-disabled">前の日: なし</span>`,
-    `<a href="../index.html">一覧へ</a>`,
-    nextPost ? `<a href="./${path.posix.basename(nextPost.htmlPath)}">次の日: ${escapeHtml(nextPost.date || nextPost.title)}</a>` : `<span class="is-disabled">次の日: なし</span>`
-  ];
-  return `<nav class="blog-post-nav">${links.join("<span class=\"sep\">|</span>")}</nav>`;
-}
-function wrapBlogLayoutHtml(sidebarHtml, contentHtml, taxonomyHtml, pageTitle) {
-  return `<!doctype html><html lang="ja"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>${escapeHtml(pageTitle)}</title><style>:root{--bg:#efe4d1;--panel:#fbf7f0;--ink:#1f1a17;--accent:#a54b2a;--line:#ddcdbd;--muted:#6f6257}*{box-sizing:border-box}body{margin:0;font-family:"Yu Mincho","Hiragino Mincho ProN",serif;color:var(--ink);background:radial-gradient(circle at top left,rgba(165,75,42,.12),transparent 24%),linear-gradient(180deg,#f5ede2 0%,#eadfcd 100%)}a{color:#5a45c6;text-decoration:underline}a:hover{text-decoration:none}.blog-layout{display:grid;grid-template-columns:320px minmax(0,1fr) 260px;gap:28px;max-width:1720px;margin:0 auto;padding:44px 28px 72px}.blog-sidebar,.blog-taxonomy{position:sticky;top:24px;align-self:start}.blog-sidebar-panel,.blog-content-panel,.blog-taxonomy-panel{background:var(--panel);border:1px solid var(--line);border-radius:24px;box-shadow:0 18px 42px rgba(53,37,24,.10)}.blog-sidebar-panel,.blog-taxonomy-panel{padding:34px 28px}.blog-sidebar-panel h1{margin:0 0 20px;font-size:3rem;line-height:1.05;border-bottom:2px solid var(--accent);padding-bottom:.4em}.blog-sidebar-panel h2,.blog-taxonomy-panel h2{margin:0 0 12px;font-size:1.35rem;line-height:1.25;border-bottom:1px solid var(--line);padding-bottom:.35em}.blog-taxonomy-panel h2{margin-bottom:20px;font-size:2rem;line-height:1.1;border-bottom:2px solid var(--accent);padding-bottom:.4em}.blog-sidebar-meta{margin:0 0 24px;color:var(--muted);font-size:1rem;line-height:1.8}.blog-sidebar-nav ul,.blog-archive-nav ul,.blog-taxonomy-list{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:14px}.blog-archive-nav{margin:0 0 24px}.blog-sidebar-nav li a,.blog-archive-nav li a{display:flex;flex-direction:column;gap:3px;color:inherit;text-decoration:none;padding:10px 12px;border-radius:12px}.blog-sidebar-nav li a:hover,.blog-sidebar-nav li.is-current a,.blog-archive-nav li a:hover,.blog-taxonomy-list li.is-current{background:rgba(165,75,42,.08)}.blog-post-date{font-size:.92rem;color:var(--accent)}.blog-post-title{font-size:1.05rem;line-height:1.6}.blog-main{min-width:0}.blog-content-panel{padding:28px 44px 40px}.blog-post-nav{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;align-items:center;margin:0 0 22px;font-size:1rem}.blog-post-nav.bottom{margin:28px 0 0}.blog-post-nav .sep{color:var(--muted)}.blog-post-nav .is-disabled{color:var(--muted)}.blog-article h1,.blog-index-copy h1{font-size:3rem;line-height:1.15;margin:0 0 20px;padding-bottom:.4em;border-bottom:2px solid var(--accent)}.blog-article h2,.blog-article h3{line-height:1.35;margin-top:2.2em}.blog-article p,.blog-article li,.blog-index-copy p,.blog-index-copy li{font-size:1.15rem;line-height:2}.blog-article ul,.blog-index-copy ul{padding-left:1.4em}.blog-meta{margin:0 0 20px;padding-left:1.2em}.blog-index-copy{min-height:70vh}.blog-taxonomy-list li{display:flex;justify-content:space-between;gap:12px;padding:10px 12px;border-radius:12px}.blog-taxonomy-label{line-height:1.5}.blog-taxonomy-count{color:var(--muted)}.blog-post-categories{margin-top:32px;padding-top:24px;border-top:1px solid var(--line)}.blog-post-categories h2{margin:0 0 16px;font-size:1.4rem}.blog-category-chips{display:flex;flex-wrap:wrap;gap:10px}.blog-category-chip{display:inline-flex;align-items:center;padding:8px 14px;border-radius:999px;background:rgba(165,75,42,.10);border:1px solid rgba(165,75,42,.18);font-size:1rem;color:var(--ink)}@media (max-width:1280px){.blog-layout{grid-template-columns:300px minmax(0,1fr)}.blog-taxonomy{position:static;grid-column:1 / -1}}@media (max-width:980px){.blog-layout{grid-template-columns:1fr;padding:20px 14px 40px}.blog-sidebar,.blog-taxonomy{position:static}.blog-sidebar-panel h1,.blog-article h1,.blog-index-copy h1{font-size:2.2rem}.blog-taxonomy-panel h2{font-size:1.8rem}.blog-content-panel{padding:22px 20px 28px}}</style></head><body><div class="blog-layout">${sidebarHtml}<main class="blog-main">${contentHtml}</main>${taxonomyHtml}</div></body></html>`;
-}
-function wrapBlogIndexHtml(posts, weeks = [], months = [], years = []) {
-  const sidebar = buildBlogSidebarHtml(posts, null, weeks, months, years, "index");
-  const taxonomy = buildBlogCategorySidebarHtml(posts);
-  const content = [`<section class="blog-content-panel blog-index-copy">`,`<h1>Nikki Blog</h1>`,`<p>日別、週別、月別、年別のまとまりから記事を選べます。</p>`,`<h2>年別</h2>`,`<ul>${years.map((year) => `<li><a href="./years/${path.posix.basename(year.htmlPath)}">${escapeHtml(year.year)} (${year.postCount}日)</a></li>`).join("")}</ul>`,`<h2>月別</h2>`,`<ul>${months.map((month) => `<li><a href="./months/${path.posix.basename(month.htmlPath)}">${escapeHtml(month.month)} (${month.posts.length}日)</a></li>`).join("")}</ul>`,`<h2>週別</h2>`,`<ul>${weeks.map((week) => `<li><a href="./weeks/${path.posix.basename(week.htmlPath)}">${escapeHtml(week.week)} (${week.posts.length}日)</a></li>`).join("")}</ul>`,`</section>`].join("");
-  return wrapBlogLayoutHtml(sidebar, content, taxonomy, "Nikki Blog");
-}
-function wrapBlogPostHtml(post, entry, posts, weeks = [], months = [], years = []) {
-    const currentIndex = posts.findIndex((candidate) => candidate.slug === post.slug);
-    const previousPost = currentIndex > 0 ? posts[currentIndex - 1] : null;
-    const nextPost = currentIndex >= 0 && currentIndex < posts.length - 1 ? posts[currentIndex + 1] : null;
-    const sidebar = buildBlogSidebarHtml(posts, post.slug, weeks, months, years, "post");
-    const taxonomy = buildBlogCategorySidebarHtml(posts, post);
-    const bodyHtml = marked.parse(entry.markdownBody || "");
-    const imageGalleryHtml = buildBlogImageGalleryHtml(post, entry);
-    const content = [
-      `<section class="blog-content-panel">`,
-      buildBlogNavHtml(previousPost, nextPost),
-      `<article class="blog-article">`,
-      `<h1>${escapeHtml(entry.title || post.title)}</h1>`,
-      `<ul class="blog-meta"><li>日付: ${escapeHtml(entry.date || post.date || "unknown")}</li><li>entryId: ${escapeHtml(entry.itemId || post.entryId)}</li></ul>`,
-      bodyHtml,
-      imageGalleryHtml,
-      buildBlogThreadListHtml(post),
-      `<section class="blog-post-categories"><h2>カテゴリ</h2><div class="blog-category-chips">${(post.categories || []).map((category) => `<span class="blog-category-chip">${escapeHtml(category.label)}</span>`).join("") || `<span class="blog-category-chip">未分類</span>`}</div></section>`,
-      `</article>`,
-      buildBlogNavHtml(previousPost, nextPost).replace("blog-post-nav", "blog-post-nav bottom"),
-      `</section>`
-    ].join("");
-    return wrapBlogLayoutHtml(sidebar, content, taxonomy, entry.title || post.title || "Nikki Blog");
-  }
-  function wrapBlogWeekHtml(week, posts, weeks = [], months = [], years = []) {
-    const sidebar = buildBlogSidebarHtml(posts, null, weeks, months, years, "week");
-    const taxonomy = buildBlogCategorySidebarHtml(week.posts || []);
-    const statsHtml = marked.parse(buildArchiveStatsMarkdown(week.stats));
-    const summaryHtml = week.summary ? marked.parse(buildWeeklySummaryMarkdown(week.summary)) : "";
-    const content = [
-      `<section class="blog-content-panel blog-index-copy">`,
-      `<h1>${escapeHtml(week.summary?.title || week.title)}</h1>`,
-      `<p>${escapeHtml(week.posts.length)}日分の記録</p>`,
-      statsHtml ? `<article class="blog-article">${statsHtml}</article>` : "",
-      summaryHtml ? `<article class="blog-article">${summaryHtml}</article>` : "",
-      `<h2>日別</h2>`,
-      `<ul>`,
-      ...(week.posts || []).map((post) => `<li><a href="../posts/${path.posix.basename(post.htmlPath)}">${escapeHtml(post.date || "unknown")} | ${escapeHtml(post.title)}</a></li>`),
-      `</ul>`,
-      `</section>`
-    ].join("");
-    return wrapBlogLayoutHtml(sidebar, content, taxonomy, week.summary?.title || week.title || "Nikki Blog");
-  }
-  function wrapBlogMonthHtml(month, posts, weeks = [], months = [], years = []) {
-    const sidebar = buildBlogSidebarHtml(posts, null, weeks, months, years, "month");
-    const taxonomy = buildBlogCategorySidebarHtml(month.posts || []);
-    const statsHtml = marked.parse(buildArchiveStatsMarkdown(month.stats));
-    const summaryHtml = month.summary ? marked.parse(buildMonthlySummaryMarkdown(month.summary)) : "";
-    const content = [
-      `<section class="blog-content-panel blog-index-copy">`,
-      `<h1>${escapeHtml(month.summary?.title || month.title)}</h1>`,
-      `<p>${escapeHtml(month.posts.length)}日分の記録</p>`,
-      statsHtml ? `<article class="blog-article">${statsHtml}</article>` : "",
-      summaryHtml ? `<article class="blog-article">${summaryHtml}</article>` : "",
-      `<h2>週別</h2>`,
-      `<ul>`,
-      ...(month.weeks || []).map((week) => `<li><a href="../weeks/${path.posix.basename(week.htmlPath)}">${escapeHtml(week.week)} (${escapeHtml(week.posts.length)}日)</a></li>`),
-      `</ul>`,
-      `</section>`
-    ].join("");
-    return wrapBlogLayoutHtml(sidebar, content, taxonomy, month.summary?.title || month.title || "Nikki Blog");
-  }
-  function wrapBlogYearHtml(year, posts, weeks = [], months = [], years = []) {
-    const sidebar = buildBlogSidebarHtml(posts, null, weeks, months, years, "year");
-    const yearMonths = months.filter((month) => month.month.startsWith(year.year));
-    const taxonomy = buildBlogCategorySidebarHtml(yearMonths.flatMap((month) => month.posts || []));
-    const statsHtml = marked.parse(buildArchiveStatsMarkdown(year.stats));
-    const summaryHtml = year.summary ? marked.parse(buildYearlySummaryMarkdown(year.summary)) : "";
-    const content = [
-      `<section class="blog-content-panel blog-index-copy">`,
-      `<h1>${escapeHtml(year.summary?.title || year.title)}</h1>`,
-      `<p>${escapeHtml(yearMonths.length)}か月、${escapeHtml(year.postCount)}日分の記録</p>`,
-      statsHtml ? `<article class="blog-article">${statsHtml}</article>` : "",
-      summaryHtml ? `<article class="blog-article">${summaryHtml}</article>` : "",
-      `<h2>月別</h2>`,
-      `<ul>`,
-      ...yearMonths.map((month) => `<li><a href="../months/${path.posix.basename(month.htmlPath)}">${escapeHtml(month.month)} (${escapeHtml(month.posts.length)}日)</a></li>`),
-      `</ul>`,
-      `</section>`
-    ].join("");
-    return wrapBlogLayoutHtml(sidebar, content, taxonomy, year.summary?.title || year.title || "Nikki Blog");
-  }
-  function buildBlogImageGalleryHtml(post, entry) {
-    const images = normalizeEntryImages(entry);
-    if (!images.length) {
-      return "";
-    }
-    return [
-      `<section class="blog-image-gallery">`,
-      `<h2>生成画像</h2>`,
-      `<div class="blog-image-grid">`,
-      ...images.map((image) => {
-        const href = escapeHtml(fileUrl(image.path));
-        const caption = escapeHtml(image.caption || "生成画像");
-        return `<figure class="blog-image-card"><a href="${href}" target="_blank" rel="noreferrer"><img src="${href}" alt="${caption}" loading="lazy" /></a><figcaption>${caption}</figcaption></figure>`;
-      }),
-      `</div>`,
-      `</section>`
-      ].join("");
-  }
-  function buildBlogThreadListHtml(post) {
-    if (!post?.threads?.length) {
-      return "";
-    }
-    return [
-      `<section class="blog-thread-list">`,
-      `<h2>関連スレッド</h2>`,
-      `<ul>`,
-        ...post.threads.map((thread) => `<li><strong>${escapeHtml(thread.itemId)}</strong>: ${escapeHtml(thread.title || thread.itemId)}${thread.categoryLabel ? ` <span class="blog-thread-category">[${escapeHtml(thread.categoryLabel)}]</span>` : ""}${thread.chatgptUrl ? ` <a class="blog-thread-link" href="${escapeHtml(thread.chatgptUrl)}" target="_blank" rel="noreferrer">ChatGPTで開く</a>` : ""}</li>`),
-        `</ul>`,
-        `</section>`
-      ].join("");
-    }
-    function wrapHtml(bodyHtml) { return `<!doctype html><html lang="ja"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Nikki Diary</title><style>:root{--bg:#f5f0e8;--panel:#fffaf3;--ink:#1f1a17;--accent:#a54b2a;--line:#ddcdbd}body{margin:0;font-family:"Yu Mincho","Hiragino Mincho ProN",serif;color:var(--ink);background:radial-gradient(circle at top left,rgba(165,75,42,.10),transparent 28%),linear-gradient(180deg,#f7efe4 0%,#efe5d6 100%)}main{max-width:900px;margin:0 auto;padding:48px 20px 80px}article{background:var(--panel);border:1px solid var(--line);border-radius:20px;box-shadow:0 16px 40px rgba(53,37,24,.08);padding:40px}h1,h2,h3{line-height:1.3}h1{font-size:2.2rem;border-bottom:2px solid var(--accent);padding-bottom:.4em}h2{margin-top:2.4em;color:var(--accent)}p,li{font-size:1rem;line-height:1.9}ul{padding-left:1.4em}.blog-image-gallery,.blog-thread-list{margin-top:32px;padding-top:20px;border-top:1px solid var(--line)}.blog-image-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}.blog-image-card{margin:0}.blog-image-card img{display:block;width:100%;height:auto;border-radius:14px;border:1px solid var(--line)}.blog-image-card figcaption{margin-top:8px;font-size:.95rem;line-height:1.7}.blog-thread-category{color:var(--accent)}.blog-thread-link{margin-left:.5em}@media print{body{background:#fff}main{padding:0}article{box-shadow:none;border:none;border-radius:0;padding:0}}</style></head><body><main><article>${bodyHtml}</article></main></body></html>`; }
 function emitEvent(runtime, payload) { fs.appendFileSync(runtime.paths.events, `${JSON.stringify({ at: isoJst(), runId: runtime.config.runId, ...payload })}\n`, "utf8"); runtime.current.lastEvent = payload.type || null; runtime.current.note = payload.note || null; }
+configureTaskState({
+  taskInstanceId,
+  readTurn,
+  loadTurnsForThread,
+  readArtifact,
+  threadMatchesTargetScopes,
+  hasThreadSummaryInputs,
+  readUnit,
+  readEntry,
+  readWeekInput,
+  readMonthInput,
+  readYearInput,
+  loadDiaryEntries,
+  enumerateWeekItems,
+  enumerateMonthItems,
+  enumerateYearItems,
+  sameArray,
+  writeState,
+  readCategoryMaster,
+  threadItemMatchesTargetScopes,
+  hasThreadFilterScope,
+  monthWeekKey
+});
+
+configureTaskMeta({
+  readArtifact,
+  hashJson,
+  fileStat,
+  walkFiles,
+  loadThreads,
+  normalizeCategoryGroups,
+  readTurn,
+  compactTurnForAi,
+  renderPromptTemplate,
+  readCategoryMaster,
+  buildThreadMergeContext,
+  buildMergeThreadTurnsPrompt,
+  buildPromptStats,
+  getOllamaSystemPrompt,
+  threadMergeInputTokenLimit,
+  hashText,
+  threadMergeChunkSize,
+  loadScopedThreadIndex,
+  loadScopedClassifications,
+  readUnit,
+  hasThreadSummaryInputs,
+  compactUnitForAi,
+  compactThreadInputsForUnit,
+  readEntry,
+  compactEntryForAi,
+  compactDiaryDraftForAi,
+  readWeekInput,
+  compactArchiveStatsForAi,
+  compactDiaryEntryForArchiveSummary,
+  readMonthInput,
+  compactWeekSummaryForMonthlySummary,
+  readYearInput,
+  compactMonthSummaryForYearlySummary,
+  loadDiaryEntries,
+  loadWeeklySummaries,
+  loadMonthlySummaries,
+  loadYearlySummaries,
+  resolveModelForTask,
+  resolveThinkForTask,
+  clip
+});
+
+configureAiJson({
+  ensureDir,
+  readJson,
+  writeJson,
+  getAppServerClient,
+  emitEvent,
+  writeProgress,
+  logTextBlock,
+  getOllamaSystemPrompt,
+  logThinkingConsole,
+  logResponseDeltaConsole,
+  logTaskProgressConsole,
+  flushResponseDeltaConsole,
+  normalizeAiUsage,
+  isoJst,
+  clip,
+  sleep,
+  logConsole,
+  writeArtifact
+});
+
+configureAgentClient({
+  clip,
+  isoJst,
+  ensureDir,
+  sleep,
+  buildPromptStats,
+  formatDuration
+});
+
+configureRenderHandlers({
+  readArtifact,
+  writeArtifact,
+  isoJst,
+  loadDiaryEntries,
+  loadWeeklySummaries,
+  loadMonthlySummaries,
+  loadYearlySummaries,
+  readCategoryMaster,
+  ensureDir,
+  findChromiumBrowser,
+  execFileAsync,
+  fileStat,
+  estimateInputTokens,
+  sanitizeId,
+  getChangedEntryIds,
+  monthWeekKey,
+  fileUrl,
+  formatInteger
+});
+
+configureCategoryHelpers({
+  readArtifact,
+  writeArtifact,
+  isoJst,
+  sanitizeId,
+  uniqueStrings,
+  emitEvent,
+  logConsole
+});
+
+configureDeterministicHandlers({
+  readTurn,
+  readArtifact,
+  writeArtifact,
+  isoJst,
+  buildLocalAiMeta,
+  writeRaw,
+  readCategoryMaster,
+  mergeClassificationResults,
+  buildThreadMergeContext,
+  readUnit,
+  hasThreadSummaryInputs,
+  compactThreadInputsForUnit,
+  readEntry,
+  draftToMarkdown,
+  readWeekInput,
+  readMonthInput,
+  readYearInput,
+  loadDiaryEntries,
+  defaultCategoryGroups,
+  uniqueStrings,
+  clip,
+  dedupeObjects
+});
+
 function writeProgress(runtime, override = {}) { const started = new Date(runtime.startedAt); writeJson(runtime.paths.progress, { schemaVersion: 1, runId: runtime.config.runId, status: override.status ?? "running", stage: override.stage ?? runtime.current.stage, taskKey: override.taskKey ?? runtime.current.taskKey, itemType: override.itemType ?? runtime.current.itemType, currentItemId: override.currentItemId ?? runtime.current.itemId, currentTaskInstanceId: override.currentTaskInstanceId ?? runtime.current.taskInstanceId, counts: { ...runtime.counts }, startedAt: runtime.startedAt, updatedAt: isoJst(), elapsedSec: Number.isNaN(started.getTime()) ? 0 : Math.max(Math.floor((Date.now() - started.getTime()) / 1000), 0), lastEvent: override.lastEvent ?? runtime.current.lastEvent, promptPreview: override.promptPreview ?? runtime.current.promptPreview, promptStats: override.promptStats ?? runtime.current.promptStats, sentAt: override.sentAt ?? runtime.current.sentAt, note: override.note ?? runtime.current.note }); }
 function logConsole(label, target, note = "") { ensureStreamConsoleClosed(); const suffix = note ? ` ${note}` : ""; console.log(`${consoleTime()} [${label}] ${target}${suffix}`); }
 function logTaskProgressConsole(runtime) {
@@ -4155,1058 +2581,3 @@ function clip(text, max) { return !text ? "" : (text.length <= max ? text : `${t
 function fileStat(filePath) { if (!filePath || !fs.existsSync(filePath)) return null; const stat = fs.statSync(filePath); return { path: filePath, size: stat.size, mtimeMs: stat.mtimeMs }; }
 function rel(runtime, fullPath) { return path.relative(runtime.paths.root, fullPath).replaceAll("\\", "/"); }
 async function findChromiumBrowser() { for (const candidate of [process.env.EDGE_PATH, process.env.CHROME_PATH, "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe", "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"].filter(Boolean)) if (fs.existsSync(candidate)) return candidate; return null; }
-async function getAppServerClient(config) { if (!appServerClientPromise) appServerClientPromise = createAgentClient(config); return appServerClientPromise; }
-async function closeAppServerClient() { if (!appServerClientPromise) return; const client = await appServerClientPromise.catch(() => null); appServerClientPromise = null; if (client) await client.close(); }
-async function resolveCodexCommand() { return resolveCommand("codex", ["codex.exe", "codex.cmd", "codex"]); }
-async function resolveCopilotCommand() { return resolveCommand("github-copilot-cli", ["github-copilot-cli.exe", "github-copilot-cli.cmd", "github-copilot-cli"]); }
-
-async function createAgentClient(config) {
-  const provider = resolveRuntimeProvider(config);
-  if (provider === "copilot") {
-    return CopilotAppServerClient.create(config);
-  }
-  if (provider === "ollama") {
-    return OllamaClient.create(config);
-  }
-  return AppServerClient.create(config);
-}
-
-function resolveRuntimeProvider(config) {
-  if (config.runtime?.provider === "copilot" || config.provider === "copilot") {
-    return "copilot";
-  }
-  if (config.runtime?.provider === "ollama" || config.provider === "ollama") {
-    return "ollama";
-  }
-  return "codex";
-}
-
-function normalizeAgentRuntimeConfig(config, provider) {
-  const runtime = config.runtime && typeof config.runtime === "object" && !Array.isArray(config.runtime) ? config.runtime : {};
-  const resolvedProvider = runtime.provider === "copilot" || provider === "copilot"
-    ? "copilot"
-    : runtime.provider === "ollama" || provider === "ollama"
-      ? "ollama"
-      : "codex";
-  return {
-    provider: resolvedProvider,
-    codex: normalizeProviderOptions(runtime.codex, {
-      transport: "stdio",
-      command: undefined,
-      args: ["app-server"],
-      cwd: process.cwd(),
-      env: null,
-      websocketUrl: undefined
-    }),
-    copilot: normalizeProviderOptions(runtime.copilot, {
-      transport: "tcp",
-      host: "127.0.0.1",
-      port: 8765,
-      command: undefined,
-      args: ["--acp", "--stdio"],
-      cwd: process.cwd(),
-      env: null
-    }),
-    ollama: normalizeProviderOptions(runtime.ollama, {
-      baseUrl: "http://127.0.0.1:11434",
-      keepAlive: "5m",
-      think: null,
-      headers: null,
-      options: null,
-      system: null
-    })
-  };
-}
-
-function normalizeProviderOptions(value, defaults) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return { ...defaults };
-  }
-  return { ...defaults, ...value };
-}
-
-async function resolveCommand(baseName, winCandidates) {
-  if (process.platform !== "win32") return baseName;
-  for (const candidate of winCandidates.map((name) => path.join(process.env.APPDATA || "", "npm", name)).filter(Boolean)) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  try {
-    const { stdout } = await execFileAsync("where.exe", [baseName], { windowsHide: true, maxBuffer: 1024 * 1024 });
-    const candidates = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-    if (candidates[0]) return candidates[0];
-  } catch {}
-  return baseName;
-}
-
-class BaseRpcClient {
-  constructor(config, eventLogName, providerLabel) {
-    this.config = config;
-    this.providerLabel = providerLabel;
-    this.nextId = 1;
-    this.buffer = "";
-    this.pending = new Map();
-    this.listeners = new Set();
-    this.requestHandler = null;
-    this.eventLogPath = path.join(config.outputDir, "logs", eventLogName);
-  }
-
-  request(method, params) {
-    const id = this.nextId++;
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.write({ jsonrpc: "2.0", id, method, params });
-    });
-  }
-
-  notify(method, params) {
-    this.write({ jsonrpc: "2.0", method, params });
-  }
-
-  addListener(listener) {
-    this.listeners.add(listener);
-  }
-
-  removeListener(listener) {
-    this.listeners.delete(listener);
-  }
-
-  setRequestHandler(handler) {
-    this.requestHandler = handler;
-  }
-
-  consume(text) {
-    this.buffer += text;
-    let index = this.buffer.indexOf("\n");
-    while (index >= 0) {
-      const line = this.buffer.slice(0, index).trim();
-      this.buffer = this.buffer.slice(index + 1);
-      if (line) {
-        this.handle(JSON.parse(line));
-      }
-      index = this.buffer.indexOf("\n");
-    }
-  }
-
-  handle(message) {
-    if (typeof message.id !== "undefined" && typeof message.method === "string" && typeof message.result === "undefined" && typeof message.error === "undefined") {
-      this.handleIncomingRequest(message);
-      return;
-    }
-    if (typeof message.id !== "undefined") {
-      const pending = this.pending.get(message.id);
-      if (!pending) return;
-      this.pending.delete(message.id);
-      if (message.error) {
-        pending.reject(new Error(JSON.stringify(message.error)));
-      } else {
-        pending.resolve(message.result ?? {});
-      }
-      return;
-    }
-    for (const listener of this.listeners) {
-      listener(message);
-    }
-  }
-
-  handleIncomingRequest(message) {
-    if (!this.requestHandler) {
-      this.write({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Method not found" } });
-      return;
-    }
-
-    Promise.resolve(this.requestHandler(message))
-      .then((result) => {
-        this.write({ jsonrpc: "2.0", id: message.id, result: result ?? {} });
-      })
-      .catch((error) => {
-        this.write({
-          jsonrpc: "2.0",
-          id: message.id,
-          error: { code: -32603, message: error instanceof Error ? error.message : String(error) }
-        });
-      });
-  }
-
-  rejectAll(error) {
-    for (const pending of this.pending.values()) {
-      pending.reject(error);
-    }
-    this.pending.clear();
-  }
-
-  log(entry) {
-    ensureDir(path.dirname(this.eventLogPath));
-    fs.appendFileSync(this.eventLogPath, `${JSON.stringify({ at: isoJst(), provider: this.providerLabel, ...entry })}\n`, "utf8");
-  }
-}
-
-class StdioRpcClient extends BaseRpcClient {
-  static async create(config, command, args, options = {}) {
-    const child = spawn(command, args, {
-      cwd: options.cwd || process.cwd(),
-      env: options.env ? { ...process.env, ...options.env } : process.env,
-      windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe"],
-      shell: process.platform === "win32" && /\.cmd$/i.test(command)
-    });
-    return new StdioRpcClient(config, options.eventLogName, options.providerLabel, child);
-  }
-
-  constructor(config, eventLogName, providerLabel, child) {
-    super(config, eventLogName, providerLabel);
-    this.child = child;
-    child.stdout.on("data", (chunk) => this.consume(String(chunk)));
-    child.stderr.on("data", (chunk) => this.log({ stream: "stderr", text: String(chunk).trim() }));
-    child.on("error", (error) => this.rejectAll(error));
-    child.on("close", (code) => this.rejectAll(new Error(`${providerLabel} process exited with code ${code}`)));
-  }
-
-  write(message) {
-    this.child.stdin.write(`${JSON.stringify(message)}\n`, "utf8");
-  }
-
-  async close() {
-    if (!this.child || this.child.killed) return;
-    this.child.stdin.end();
-    this.child.kill();
-    await new Promise((resolve) => {
-      this.child.once("close", () => resolve());
-      setTimeout(resolve, 1000);
-    });
-  }
-}
-
-class TcpRpcClient extends BaseRpcClient {
-  static async create(config, host, port, options = {}) {
-    const socket = await new Promise((resolve, reject) => {
-      const client = net.createConnection({ host, port }, () => resolve(client));
-      client.once("error", reject);
-    });
-    return new TcpRpcClient(config, options.eventLogName, options.providerLabel, socket);
-  }
-
-  constructor(config, eventLogName, providerLabel, socket) {
-    super(config, eventLogName, providerLabel);
-    this.socket = socket;
-    socket.setEncoding("utf8");
-    socket.on("data", (chunk) => this.consume(String(chunk)));
-    socket.on("error", (error) => this.rejectAll(error));
-    socket.on("close", () => this.rejectAll(new Error(`${providerLabel} tcp connection closed`)));
-  }
-
-  write(message) {
-    this.socket.write(`${JSON.stringify(message)}\n`, "utf8");
-  }
-
-  async close() {
-    if (!this.socket) return;
-    const socket = this.socket;
-    this.socket = null;
-    await new Promise((resolve) => {
-      socket.end(() => resolve());
-      setTimeout(resolve, 1000);
-    });
-  }
-}
-
-class AppServerClient {
-  static async create(config) {
-    const codex = config.runtime?.codex || {};
-    const transport = codex.transport || "stdio";
-    if (transport !== "stdio") {
-      throw new Error(`未対応の Codex transport です: ${transport}`);
-    }
-    const command = codex.command || await resolveCodexCommand();
-    const args = Array.isArray(codex.args) && codex.args.length ? codex.args : ["app-server"];
-    const rpc = await StdioRpcClient.create(config, command, args, {
-      cwd: codex.cwd || process.cwd(),
-      env: codex.env || undefined,
-      eventLogName: "app-server-events.log",
-      providerLabel: "codex"
-    });
-    const client = new AppServerClient(rpc, config);
-    await client.initialize();
-    return client;
-  }
-
-  constructor(rpc, config) {
-    this.rpc = rpc;
-    this.config = config;
-  }
-
-  async initialize() {
-    await this.rpc.request("initialize", { clientInfo: { name: "nikki", version: "0.2.0" }, capabilities: null });
-    this.rpc.notify("initialized", {});
-  }
-
-  async runJsonTurn({ model, cwd, prompt, onProgress }) {
-    const preview = clip(prompt.replace(/\s+/g, " "), 220);
-    onProgress?.({ phase: "thread-start", promptPreview: preview, note: "一時スレッドを作成中" });
-    const threadStart = await this.rpc.request("thread/start", {
-      model,
-      cwd,
-      approvalPolicy: "never",
-      sandbox: "read-only",
-      ephemeral: false,
-      experimentalRawEvents: false,
-      developerInstructions: [
-        "常に日本語で応答してください。",
-        "最終応答は JSON オブジェクトのみ。",
-        "説明文、コードブロック、前置きは禁止。",
-        "コマンド実行、ファイル変更、ツール使用は禁止。"
-      ].join("\n")
-    });
-    const threadId = threadStart.thread.id;
-    const sentAt = isoJst();
-    const done = this.waitForTurn(threadId);
-    const listener = (message) => {
-      if (message.params?.threadId !== threadId) return;
-      this.rpc.log({ method: message.method });
-      const mapped = progressFromNotification("codex", message);
-      if (mapped) onProgress?.({ threadId, promptPreview: preview, sentAt, ...mapped });
-    };
-    this.rpc.addListener(listener);
-    onProgress?.({ phase: "turn-start", threadId, promptPreview: preview, sentAt, note: "プロンプト送信中" });
-    await this.rpc.request("turn/start", {
-      threadId,
-      input: [{ type: "text", text: prompt, text_elements: [] }],
-      cwd,
-      approvalPolicy: "never",
-      sandboxPolicy: { type: "readOnly" },
-      model,
-      effort: null,
-      summary: "auto"
-    });
-    onProgress?.({ phase: "waiting", threadId, promptPreview: preview, sentAt, note: "モデル応答を待機中" });
-    const completed = await done;
-    this.rpc.removeListener(listener);
-    if (completed.turn?.status !== "completed") throw new Error(`app-server turn failed: ${JSON.stringify(completed)}`);
-    const threadRead = await this.rpc.request("thread/read", { threadId, includeTurns: true });
-    const turns = threadRead.thread?.turns || [];
-    const lastTurn = turns[turns.length - 1];
-    const message = [...(lastTurn?.items || [])].reverse().find((item) => item.type === "agentMessage");
-    if (!message?.text) throw new Error("app-server から最終 agentMessage を取得できませんでした。");
-    onProgress?.({ phase: "done", threadId, promptPreview: preview, sentAt, note: "最終応答の取得完了" });
-    return message.text;
-  }
-
-  waitForTurn(threadId) {
-    return new Promise((resolve) => {
-      const listener = (message) => {
-        if (message.method === "turn/completed" && message.params?.threadId === threadId) {
-          this.rpc.removeListener(listener);
-          resolve(message.params);
-        }
-      };
-      this.rpc.addListener(listener);
-    });
-  }
-
-  async close() {
-    await this.rpc.close();
-  }
-}
-
-class CopilotAppServerClient {
-  static async create(config) {
-    const copilot = config.runtime?.copilot || {};
-    let rpc;
-    if ((copilot.transport || "tcp") === "stdio") {
-      const command = copilot.command || await resolveCopilotCommand();
-      const args = Array.isArray(copilot.args) && copilot.args.length ? copilot.args : ["--acp", "--stdio"];
-      rpc = await StdioRpcClient.create(config, command, args, {
-        cwd: copilot.cwd || process.cwd(),
-        env: copilot.env || undefined,
-        eventLogName: "copilot-events.log",
-        providerLabel: "copilot"
-      });
-    } else {
-      rpc = await TcpRpcClient.create(config, copilot.host || "127.0.0.1", Number(copilot.port || 8765), {
-        eventLogName: "copilot-events.log",
-        providerLabel: "copilot"
-      });
-    }
-    const client = new CopilotAppServerClient(rpc, config);
-    await client.initialize();
-    return client;
-  }
-
-  constructor(rpc, config) {
-    this.rpc = rpc;
-    this.config = config;
-    this.providerSessionId = null;
-    this.rpc.setRequestHandler((message) => this.handleRequest(message));
-  }
-
-  async initialize() {
-    await this.rpc.request("initialize", {
-      protocolVersion: 1,
-      clientCapabilities: {},
-      clientInfo: { name: "nikki", version: "0.2.0" }
-    });
-    const started = await this.rpc.request("session/new", {
-      cwd: process.cwd(),
-      mcpServers: []
-    });
-    this.providerSessionId = started.sessionId || "nikki";
-  }
-
-  async runJsonTurn({ model, cwd, prompt, onProgress }) {
-    if (!this.providerSessionId) {
-      throw new Error("copilot session is not initialized");
-    }
-    const preview = clip(prompt.replace(/\s+/g, " "), 220);
-    const sentAt = isoJst();
-    let accumulated = "";
-    const listener = (message) => {
-      this.rpc.log({ method: message.method });
-      if (message.method === "session/update" && message.params?.sessionId === this.providerSessionId) {
-        const update = message.params.update || {};
-        if (update.sessionUpdate === "agent_message_chunk" && update.content?.type === "text") {
-          accumulated += String(update.content.text || "");
-        }
-      }
-      const mapped = progressFromNotification("copilot", message);
-      if (mapped) onProgress?.({ promptPreview: preview, sentAt, ...mapped });
-    };
-    this.rpc.addListener(listener);
-    onProgress?.({ phase: "turn-start", promptPreview: preview, sentAt, note: "Copilot にプロンプト送信中" });
-    const result = await this.rpc.request("session/prompt", {
-      sessionId: this.providerSessionId,
-      prompt: [{ type: "text", text: prompt }],
-      _meta: { cwd, model: model || this.config.model }
-    });
-    onProgress?.({ phase: "waiting", promptPreview: preview, sentAt, note: "Copilot 応答を待機中" });
-    this.rpc.removeListener(listener);
-    const text = accumulated;
-    if (!text) {
-      throw new Error("copilot から最終応答を取得できませんでした。");
-    }
-    if (result.stopReason && result.stopReason !== "end_turn") {
-      this.rpc.log({ method: "session/prompt", stopReason: result.stopReason });
-    }
-    onProgress?.({ phase: "done", promptPreview: preview, sentAt, note: "最終応答の取得完了" });
-    return text;
-  }
-
-  async handleRequest(message) {
-    if (message.method === "session/request_permission") {
-      return { outcome: { outcome: "cancelled" } };
-    }
-    throw new Error(`unsupported ACP client request: ${message.method}`);
-  }
-
-  async close() {
-    await this.rpc.close();
-  }
-}
-
-class OllamaClient {
-  static async create(config) {
-    return new OllamaClient(config);
-  }
-
-  constructor(config) {
-    this.config = config;
-    this.ollama = config.runtime?.ollama || {};
-    this.baseUrl = String(this.ollama.baseUrl || "http://127.0.0.1:11434").replace(/\/+$/, "");
-    this.eventLogPath = path.join(config.outputDir, "logs", "ollama-events.log");
-    this.command = String(this.ollama.command || "ollama");
-    this.activeModel = null;
-    this.waitForIdleModelAfterError = null;
-  }
-
-  async runJsonTurn({ model, think, cwd, prompt, onProgress }) {
-    const preview = clip(prompt.replace(/\s+/g, " "), 220);
-    const sentAt = isoJst();
-    const finalModel = model || this.config.model;
-    await this.waitForPreviousErrorModelIdle(finalModel, onProgress, preview, sentAt);
-    await this.ensureModelReady(finalModel, onProgress, preview, sentAt);
-    const systemPrompt = getOllamaSystemPrompt(this.config);
-    const body = {
-      model: finalModel,
-      system: systemPrompt,
-      prompt,
-      stream: true
-    };
-
-    if (this.ollama.keepAlive) {
-      body.keep_alive = this.ollama.keepAlive;
-    }
-    if (typeof think === "boolean") {
-      body.think = think;
-    } else if (typeof this.ollama.think === "boolean") {
-      body.think = this.ollama.think;
-    }
-    if (this.ollama.options && typeof this.ollama.options === "object" && !Array.isArray(this.ollama.options)) {
-      body.options = this.ollama.options;
-    }
-
-    const promptStats = buildPromptStats({ prompt, systemPrompt });
-    onProgress?.({ phase: "system", promptPreview: preview, promptStats, sentAt, note: "Ollama system prompt を送信します", systemPrompt });
-    onProgress?.({ phase: "turn-start", promptPreview: preview, promptStats, sentAt, note: "Ollama にプロンプト送信中" });
-    this.log({ phase: "request", model: finalModel, cwd, promptPreview: preview, promptStats, think: typeof body.think === "boolean" ? body.think : null });
-
-    const url = `${this.baseUrl}/api/generate`;
-    const timeoutMs = Number(this.ollama.requestTimeoutMs || 0);
-    const headersTimeoutMs = Number(this.ollama.headersTimeoutMs || 0);
-    const bodyTimeoutMs = Number(this.ollama.bodyTimeoutMs || 0);
-    const fetchOptions = {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...normalizeHeaders(this.ollama.headers)
-      },
-      body: JSON.stringify(body)
-    };
-    if (timeoutMs > 0 && typeof AbortSignal?.timeout === "function") {
-      fetchOptions.signal = AbortSignal.timeout(timeoutMs);
-    }
-
-    let output = "";
-    let usage = null;
-    try {
-      const response = await requestOllamaStream(url, {
-        method: fetchOptions.method,
-        headers: fetchOptions.headers,
-        body: fetchOptions.body,
-        signal: fetchOptions.signal,
-        headersTimeoutMs,
-        bodyTimeoutMs
-      });
-
-      if (!response.ok) {
-        const text = await response.text();
-        this.log({ phase: "response", status: response.status, ok: response.ok, preview: clip(text, 500) });
-        throw new Error(extractOllamaErrorMessage(response.status, text));
-      }
-      onProgress?.({ phase: "waiting", promptPreview: preview, sentAt, note: "Ollama 応答を待機中" });
-      const streamed = await readOllamaStream(response, { preview, sentAt, onProgress, log: (entry) => this.log(entry) });
-      output = streamed.output;
-      usage = streamed.usage;
-      const thinkingText = streamed.thinking;
-      if (!output) {
-        throw new Error("Ollama から最終応答を取得できませんでした。");
-      }
-    } catch (error) {
-      const normalizedError = normalizeOllamaFetchError(error, { url, model: finalModel, timeoutMs, headersTimeoutMs, bodyTimeoutMs });
-      this.log({
-        phase: "transport-error",
-        model: finalModel,
-        url,
-        timeoutMs: timeoutMs || null,
-        headersTimeoutMs: headersTimeoutMs || null,
-        bodyTimeoutMs: bodyTimeoutMs || null,
-        error: String(normalizedError.message || normalizedError)
-      });
-      if (shouldWaitForOllamaIdleAfterError(normalizedError)) {
-        this.waitForIdleModelAfterError = finalModel;
-        this.log({ phase: "model-idle-wait-scheduled", model: finalModel, reason: String(normalizedError.message || normalizedError) });
-      }
-      throw normalizedError;
-    }
-
-    onProgress?.({ phase: "done", promptPreview: preview, sentAt, note: "最終応答の取得完了" });
-    this.activeModel = finalModel;
-    return { text: output, usage };
-  }
-
-  async close() {}
-
-  async waitForPreviousErrorModelIdle(nextModel, onProgress, preview, sentAt) {
-    const model = this.waitForIdleModelAfterError;
-    if (!model || !nextModel || model !== nextModel) {
-      return;
-    }
-    const maxWaitMs = Number(this.ollama.waitForModelIdleAfterErrorMs || 30 * 60 * 1000);
-    const pollMs = Number(this.ollama.waitForModelIdlePollMs || 10000);
-    const startedAt = Date.now();
-    let attempt = 0;
-    while (Date.now() - startedAt < maxWaitMs) {
-      attempt += 1;
-      const loaded = await this.listLoadedModels();
-      if (!loaded.includes(model)) {
-        this.waitForIdleModelAfterError = null;
-        const note = `前回エラー後の ${model} アンロードを確認しました`;
-        onProgress?.({ phase: "ollama-idle", promptPreview: preview, sentAt, note });
-        this.log({ phase: "model-idle-confirmed", model, attempts: attempt, waitedMs: Date.now() - startedAt });
-        return;
-      }
-      const note = `前回エラー後も ${model} がロード中のため、新規リクエストを待機します (${formatDuration(Date.now() - startedAt)}/${formatDuration(maxWaitMs)})`;
-      onProgress?.({ phase: "ollama-busy-wait", promptPreview: preview, sentAt, note });
-      this.log({ phase: "model-idle-wait", model, attempt, waitedMs: Date.now() - startedAt });
-      await sleep(pollMs);
-    }
-    const message = `前回エラー後も ${model} がアンロードされないため、新規リクエストを中止しました (wait=${maxWaitMs}ms)`;
-    this.log({ phase: "model-idle-wait-timeout", model, waitedMs: Date.now() - startedAt });
-    throw new Error(message);
-  }
-
-  async ensureModelReady(nextModel, onProgress, preview, sentAt) {
-    if (!nextModel || !this.activeModel || this.activeModel === nextModel) {
-      return;
-    }
-    const oldModel = this.activeModel;
-    const note = `モデル切替のため ${oldModel} をアンロードします`;
-    onProgress?.({ phase: "model-switch", promptPreview: preview, sentAt, note });
-    this.log({ phase: "model-switch", from: oldModel, to: nextModel });
-    await this.stopModel(oldModel);
-    await this.waitForModelUnload(oldModel);
-  }
-
-  async stopModel(model) {
-    try {
-      await execFileAsync(this.command, ["stop", model], { windowsHide: true });
-      this.log({ phase: "model-stop", model, status: "ok" });
-    } catch (error) {
-      this.log({ phase: "model-stop", model, status: "failed", error: String(error instanceof Error ? error.message : error) });
-    }
-  }
-
-  async waitForModelUnload(model) {
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      const loaded = await this.listLoadedModels();
-      if (!loaded.includes(model)) {
-        this.log({ phase: "model-unloaded", model, attempts: attempt + 1 });
-        return;
-      }
-      await sleep(500);
-    }
-    this.log({ phase: "model-unload-timeout", model });
-  }
-
-  async listLoadedModels() {
-    try {
-      const { stdout } = await execFileAsync(this.command, ["ps"], { windowsHide: true, maxBuffer: 1024 * 1024 });
-      return parseOllamaPsModels(stdout);
-    } catch (error) {
-      this.log({ phase: "model-ps", status: "failed", error: String(error instanceof Error ? error.message : error) });
-      return [];
-    }
-  }
-
-  log(entry) {
-    ensureDir(path.dirname(this.eventLogPath));
-    fs.appendFileSync(this.eventLogPath, `${JSON.stringify({ at: isoJst(), provider: "ollama", ...entry })}\n`, "utf8");
-  }
-}
-
-function getOllamaSystemPrompt(config) {
-  return config?.runtime?.ollama?.system || [
-    "常に日本語で応答してください。",
-    "Respond in Japanese.",
-    "Return exactly one JSON object.",
-    "Do not output markdown.",
-    "Do not output code fences.",
-    "Do not output explanations.",
-    "Do not output any text before or after JSON."
-  ].join("\n");
-}
-
-function normalizeHeaders(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return {};
-  }
-  return Object.fromEntries(
-    Object.entries(value)
-      .filter(([, entry]) => typeof entry === "string" || typeof entry === "number" || typeof entry === "boolean")
-      .map(([key, entry]) => [key, String(entry)])
-  );
-}
-
-function extractOllamaErrorMessage(status, text) {
-  try {
-    const parsed = JSON.parse(text);
-    if (parsed?.error) {
-      return `Ollama error (${status}): ${parsed.error}`;
-    }
-  } catch {}
-  return `Ollama error (${status}): ${clip(text || "unknown error", 400)}`;
-}
-
-async function requestOllamaStream(url, options = {}) {
-  const target = new URL(url);
-  const transport = target.protocol === "https:" ? https : http;
-  const headers = options.headers || {};
-  const headersTimeoutMs = Number(options.headersTimeoutMs || 0);
-  const bodyTimeoutMs = Number(options.bodyTimeoutMs || 0);
-
-  return await new Promise((resolve, reject) => {
-    let settled = false;
-    let headersTimer = null;
-    const request = transport.request(target, {
-      method: options.method || "POST",
-      headers
-    });
-
-    const cleanup = () => {
-      if (headersTimer) {
-        clearTimeout(headersTimer);
-        headersTimer = null;
-      }
-      if (options.signal && abortHandler) {
-        options.signal.removeEventListener("abort", abortHandler);
-      }
-    };
-
-    const fail = (error) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup();
-      reject(error);
-    };
-
-    const succeed = (response) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup();
-      resolve(response);
-    };
-
-    const abortHandler = () => {
-      const abortError = new Error("The operation was aborted due to timeout");
-      abortError.name = "TimeoutError";
-      request.destroy(abortError);
-      fail(abortError);
-    };
-
-    if (options.signal) {
-      if (options.signal.aborted) {
-        abortHandler();
-        return;
-      }
-      options.signal.addEventListener("abort", abortHandler, { once: true });
-    }
-
-    if (headersTimeoutMs > 0) {
-      headersTimer = setTimeout(() => {
-        const timeoutError = new Error("Headers Timeout Error");
-        timeoutError.code = "UND_ERR_HEADERS_TIMEOUT";
-        request.destroy(timeoutError);
-        fail(timeoutError);
-      }, headersTimeoutMs);
-    }
-
-    request.on("response", (incoming) => {
-      if (bodyTimeoutMs > 0) {
-        incoming.setTimeout(bodyTimeoutMs, () => {
-          const timeoutError = new Error("Body Timeout Error");
-          timeoutError.code = "UND_ERR_BODY_TIMEOUT";
-          incoming.destroy(timeoutError);
-        });
-      }
-      const response = new Response(Readable.toWeb(incoming), {
-        status: incoming.statusCode || 0,
-        statusText: incoming.statusMessage || "",
-        headers: incoming.headers
-      });
-      succeed(response);
-    });
-
-    request.on("error", (error) => {
-      fail(error);
-    });
-
-    if (options.body) {
-      request.write(options.body);
-    }
-    request.end();
-  });
-}
-
-function normalizeOllamaFetchError(error, context = {}) {
-  if (error instanceof Error && /^Ollama error \(\d+\):/i.test(error.message)) {
-    return error;
-  }
-  const cause = error && typeof error === "object" ? error.cause : null;
-  const timeoutMs = Number(context.timeoutMs || 0);
-  const headersTimeoutMs = Number(context.headersTimeoutMs || 0);
-  const bodyTimeoutMs = Number(context.bodyTimeoutMs || 0);
-  const url = context.url || "Ollama";
-  const model = context.model ? ` model=${context.model}` : "";
-  const causeCode = cause && typeof cause === "object" && "code" in cause ? String(cause.code || "").trim() : "";
-  const causeMessage = cause instanceof Error ? cause.message : (cause && typeof cause === "object" && "message" in cause ? String(cause.message || "") : "");
-  const rawMessage = error instanceof Error ? error.message : String(error || "");
-  const detail = [causeCode, causeMessage, rawMessage]
-    .map((value) => String(value || "").trim())
-    .filter((value, index, values) => value && values.indexOf(value) === index && value.toLowerCase() !== "fetch failed")
-    .join(" / ");
-
-  if (isOllamaTimeoutFailure({ rawMessage, causeCode, causeMessage, errorName: error?.name, causeName: cause?.name, detail })) {
-    const timeoutParts = [
-      timeoutMs > 0 ? `timeout=${timeoutMs}ms` : "",
-      headersTimeoutMs > 0 ? `headersTimeout=${headersTimeoutMs}ms` : "",
-      bodyTimeoutMs > 0 ? `bodyTimeout=${bodyTimeoutMs}ms` : ""
-    ].filter(Boolean).join(" ");
-    return new Error(`Ollama 応答がタイムアウトしました: ${url}${model}${timeoutParts ? ` ${timeoutParts}` : ""}${detail ? ` (${detail})` : ""}`);
-  }
-  if (/fetch failed/i.test(rawMessage) || /ECONNREFUSED|ECONNRESET|EPIPE|ETIMEDOUT|UND_ERR_/i.test(detail)) {
-    return new Error(`Ollama への接続に失敗しました: ${url}${model}${detail ? ` (${detail})` : ""}`);
-  }
-  return error instanceof Error ? error : new Error(rawMessage || "Ollama への接続に失敗しました。");
-}
-
-function isOllamaTimeoutFailure({ rawMessage, causeCode, causeMessage, errorName, causeName, detail }) {
-  const text = [rawMessage, causeCode, causeMessage, errorName, causeName, detail]
-    .map((value) => String(value || "").trim())
-    .filter(Boolean)
-    .join(" / ");
-  return /The operation was aborted due to timeout|TimeoutError|UND_ERR_HEADERS_TIMEOUT|Headers Timeout Error|UND_ERR_BODY_TIMEOUT|Body Timeout Error|ETIMEDOUT/i.test(text);
-}
-
-function shouldWaitForOllamaIdleAfterError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return /Ollama 応答がタイムアウトしました|Ollama への接続に失敗しました|UND_ERR_HEADERS_TIMEOUT|Headers Timeout Error|UND_ERR_BODY_TIMEOUT|Body Timeout Error|fetch failed|ECONNRESET|socket hang up/i.test(message);
-}
-
-function parseOllamaPsModels(text) {
-  return String(text || "")
-    .split(/\r?\n/)
-    .slice(1)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => line.split(/\s{2,}/)[0]?.trim())
-    .filter(Boolean);
-}
-
-async function readOllamaStream(response, context) {
-  if (!response.body) {
-    throw new Error("Ollama のストリームを取得できませんでした。");
-  }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let output = "";
-  let thinking = "";
-  let sawDone = false;
-  let responseLineBuffer = "";
-  let recentResponseLines = [];
-  let recentResponseLastSemanticLine = "";
-  let usage = null;
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
-    }
-    buffer += decoder.decode(value, { stream: true });
-    let newlineIndex = buffer.indexOf("\n");
-    while (newlineIndex >= 0) {
-      const line = buffer.slice(0, newlineIndex).trim();
-      buffer = buffer.slice(newlineIndex + 1);
-        if (line) {
-          const chunk = parseOllamaStreamChunk(line);
-          sawDone ||= Boolean(chunk.done);
-          usage = extractOllamaUsage(chunk) || usage;
-          const thinkingChunk = typeof chunk.thinking === "string"
-          ? chunk.thinking
-          : typeof chunk.message?.thinking === "string"
-            ? chunk.message.thinking
-            : "";
-        const responseChunk = typeof chunk.response === "string"
-          ? chunk.response
-          : typeof chunk.message?.content === "string"
-            ? chunk.message.content
-            : "";
-        if (thinkingChunk) {
-          thinking += thinkingChunk;
-          context.log({ phase: "thinking-chunk", preview: clip(thinkingChunk, 200) });
-          context.onProgress?.({ phase: "thinking", promptPreview: context.preview, sentAt: context.sentAt, note: `thinking: ${clip(thinkingChunk, 80)}`, thinkingText: thinkingChunk });
-        }
-        if (responseChunk) {
-          output += responseChunk;
-          const repetition = detectRepeatedResponseLine(responseChunk, {
-            lineBuffer: responseLineBuffer,
-            recentLines: recentResponseLines,
-            lastSemanticLine: recentResponseLastSemanticLine
-          });
-          responseLineBuffer = repetition.lineBuffer;
-          recentResponseLines = repetition.recentLines;
-          recentResponseLastSemanticLine = repetition.lastSemanticLine;
-          if (repetition.abort) {
-            context.log({ phase: "response-loop-detected", line: repetition.repeatedLine, count: repetition.repeatedLineCount });
-            try {
-              await reader.cancel("repeated response line detected");
-            } catch {}
-            throw new Error(`Ollama 応答が同一行を繰り返したため中断しました: ${clip(repetition.repeatedLine || "", 120)} (count=${repetition.repeatedLineCount})`);
-          }
-          context.log({ phase: "response-chunk", preview: clip(responseChunk, 200) });
-          context.onProgress?.({ phase: "agent-message", promptPreview: context.preview, sentAt: context.sentAt, note: `応答生成中: ${clip(responseChunk, 80)}`, deltaText: responseChunk });
-        }
-      }
-      newlineIndex = buffer.indexOf("\n");
-    }
-  }
-
-  const tail = buffer.trim();
-  if (tail) {
-    const chunk = parseOllamaStreamChunk(tail);
-    sawDone ||= Boolean(chunk.done);
-    usage = extractOllamaUsage(chunk) || usage;
-    const thinkingChunk = typeof chunk.thinking === "string"
-      ? chunk.thinking
-      : typeof chunk.message?.thinking === "string"
-        ? chunk.message.thinking
-        : "";
-    const responseChunk = typeof chunk.response === "string"
-      ? chunk.response
-      : typeof chunk.message?.content === "string"
-        ? chunk.message.content
-        : "";
-    if (thinkingChunk) {
-      thinking += thinkingChunk;
-      context.log({ phase: "thinking-chunk", preview: clip(thinkingChunk, 200) });
-      context.onProgress?.({ phase: "thinking", promptPreview: context.preview, sentAt: context.sentAt, note: `thinking: ${clip(thinkingChunk, 80)}`, thinkingText: thinkingChunk });
-    }
-    if (responseChunk) {
-      output += responseChunk;
-      const repetition = detectRepeatedResponseLine(responseChunk, {
-        lineBuffer: responseLineBuffer,
-        recentLines: recentResponseLines,
-        lastSemanticLine: recentResponseLastSemanticLine
-      });
-      responseLineBuffer = repetition.lineBuffer;
-      recentResponseLines = repetition.recentLines;
-      recentResponseLastSemanticLine = repetition.lastSemanticLine;
-      if (repetition.abort) {
-        context.log({ phase: "response-loop-detected", line: repetition.repeatedLine, count: repetition.repeatedLineCount });
-        try {
-          await reader.cancel("repeated response line detected");
-        } catch {}
-        throw new Error(`Ollama 応答が同一行を繰り返したため中断しました: ${clip(repetition.repeatedLine || "", 120)} (count=${repetition.repeatedLineCount})`);
-      }
-      context.log({ phase: "response-chunk", preview: clip(responseChunk, 200) });
-      context.onProgress?.({ phase: "agent-message", promptPreview: context.preview, sentAt: context.sentAt, note: `応答生成中: ${clip(responseChunk, 80)}`, deltaText: responseChunk });
-    }
-  }
-
-  context.log({ phase: "response", ok: true, done: sawDone, preview: clip(output, 500), usage });
-  if (thinking) {
-    context.log({ phase: "thinking", preview: clip(thinking, 500) });
-  }
-  return { output, thinking, done: sawDone, usage };
-}
-
-function extractOllamaUsage(chunk) {
-  if (!chunk || typeof chunk !== "object") {
-    return null;
-  }
-  const inputTokens = toFiniteNumber(chunk.prompt_eval_count);
-  const outputTokens = toFiniteNumber(chunk.eval_count);
-  const usage = {
-    ...(inputTokens !== null ? { inputTokens } : {}),
-    ...(outputTokens !== null ? { outputTokens } : {}),
-    ...(inputTokens !== null || outputTokens !== null ? { totalTokens: (inputTokens || 0) + (outputTokens || 0) } : {}),
-    ...durationNsToMsField("totalDurationMs", chunk.total_duration),
-    ...durationNsToMsField("loadDurationMs", chunk.load_duration),
-    ...durationNsToMsField("promptEvalDurationMs", chunk.prompt_eval_duration),
-    ...durationNsToMsField("evalDurationMs", chunk.eval_duration)
-  };
-  const promptEvalCount = toFiniteNumber(chunk.prompt_eval_count);
-  const evalCount = toFiniteNumber(chunk.eval_count);
-  if (promptEvalCount !== null) usage.promptEvalCount = promptEvalCount;
-  if (evalCount !== null) usage.evalCount = evalCount;
-  return Object.keys(usage).length ? usage : null;
-}
-
-function durationNsToMsField(key, value) {
-  const number = toFiniteNumber(value);
-  return number === null ? {} : { [key]: Math.round(number / 1000000) };
-}
-
-function toFiniteNumber(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
-}
-
-function detectRepeatedResponseLine(chunk, state) {
-  let lineBuffer = `${state.lineBuffer || ""}${String(chunk || "")}`;
-  let recentLines = Array.isArray(state.recentLines) ? [...state.recentLines] : [];
-  let lastSemanticLine = state.lastSemanticLine || "";
-
-  while (true) {
-    const newlineIndex = lineBuffer.indexOf("\n");
-    if (newlineIndex < 0) {
-      break;
-    }
-    const rawLine = lineBuffer.slice(0, newlineIndex);
-    lineBuffer = lineBuffer.slice(newlineIndex + 1);
-    const normalized = rawLine.trim();
-    if (!normalized || normalized.length <= 2) {
-      continue;
-    }
-    const semanticKey = repeatedLineSemanticKey(normalized, lastSemanticLine);
-    lastSemanticLine = semanticHistoryLine(normalized) || lastSemanticLine;
-    if (!semanticKey) {
-      continue;
-    }
-    recentLines.push(semanticKey);
-    if (recentLines.length > 100) {
-      recentLines = recentLines.slice(recentLines.length - 100);
-    }
-    const repeatedLineCount = recentLines.filter((line) => line === semanticKey).length;
-    if (repeatedLineCount >= 10) {
-      return { lineBuffer, recentLines, lastSemanticLine, repeatedLine: normalized, repeatedLineCount, abort: true };
-    }
-  }
-
-  return { lineBuffer, recentLines, lastSemanticLine, repeatedLine: null, repeatedLineCount: 0, abort: false };
-}
-
-function repeatedLineSemanticKey(line, previousSemanticLine) {
-  if (isRepeatedStatusLine(line)) {
-    if (isRepeatedTextLine(previousSemanticLine)) {
-      return `${previousSemanticLine}\n${line}`;
-    }
-    return null;
-  }
-  return line;
-}
-
-function semanticHistoryLine(line) {
-  return isRepeatedTextLine(line) ? line : null;
-}
-
-function isRepeatedTextLine(line) {
-  return /^"text"\s*:\s*".*"?\s*,?$/.test(String(line || "").trim());
-}
-
-function isRepeatedStatusLine(line) {
-  return /^"status"\s*:\s*"(resolved|unresolved|partially_resolved)"\s*,?$/.test(String(line || "").trim());
-}
-
-function parseOllamaStreamChunk(line) {
-  try {
-    return JSON.parse(line);
-  } catch (error) {
-    throw new Error(`Ollama のストリーム JSON を解析できませんでした: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
-function progressFromNotification(provider, message) {
-  if (provider === "copilot") {
-    if (message.method === "session/request_permission") return { phase: "approval", note: "Copilot が承認要求を通知" };
-    if (message.method === "session/update") {
-      const update = message.params?.update || {};
-      if (update.sessionUpdate === "agent_message_chunk") return { phase: "agent-message", note: `応答生成中: ${clip(update.content?.text || "", 80)}` };
-      if (update.sessionUpdate === "agent_thought_chunk") return { phase: "reasoning", note: `reasoning: ${clip(update.content?.text || "", 80)}` };
-      if (update.sessionUpdate === "tool_call") return { phase: "tool-called", note: `tool呼び出し: ${update.title || update.kind || "unknown"}` };
-      if (update.sessionUpdate === "tool_call_update") return { phase: "tool-update", note: `tool更新: ${update.title || update.status || "unknown"}` };
-      if (update.sessionUpdate === "plan") return { phase: "plan", note: "実行計画を更新中" };
-      if (update.sessionUpdate === "current_mode_update") return { phase: "session-updated", note: `mode更新: ${update.currentModeId || "unknown"}` };
-      if (update.sessionUpdate === "session_info_update") return { phase: "session-updated", note: `session更新: ${update.title || "info"}` };
-    }
-    return null;
-  }
-  if (message.method === "turn/started") return { phase: "turn-started", note: "app-server がターン開始を通知" };
-  if (message.method === "item/started") return { phase: "item-started", note: `item開始: ${message.params?.item?.type || "unknown"}` };
-  if (message.method === "item/completed") return { phase: "item-completed", note: `item完了: ${message.params?.item?.type || "unknown"}` };
-  if (message.method === "item/reasoning/summaryTextDelta") return { phase: "reasoning", note: `reasoning: ${clip(message.params?.delta || "", 80)}` };
-  if (message.method === "item/agentMessage/delta") return { phase: "agent-message", note: `応答生成中: ${clip(message.params?.delta || "", 80)}` };
-  if (message.method === "turn/completed") return { phase: "turn-completed", note: "app-server がターン完了を通知" };
-  return null;
-}
